@@ -401,7 +401,15 @@ def calculate_route_with_transporteur(collectes, livraisons, transits, transport
 
 def creer_segments_possibles(collecte_indices, livraison_indices, transit_indices, location_info, distance_matrix, params_calcul):
     """
-    Crée tous les segments de trajet possibles
+    Crée tous les segments de trajet possibles.
+    
+    Règle fondamentale : après un transit le camion est VIDE.
+    Il n'y a donc jamais de retour au site après un transit,
+    car le site n'est nécessaire que pour décharger une collecte.
+    
+    Segments avec transit après livraison :
+      - Livraison → Transit → Collecte → Site  (enchaîne une collecte après)
+      - Livraison → Transit → Transporteur     (fin de tournée directe)
     """
     VITESSE_MOYENNE_KMH = params_calcul['vitesse_moyenne_kmh']
     TEMPS_OPERATION_HEURES = params_calcul['temps_operation_heures']
@@ -431,7 +439,7 @@ def creer_segments_possibles(collecte_indices, livraison_indices, transit_indice
     segment['duree_heures'] = segment['distance'] / 1000 / VITESSE_MOYENNE_KMH
     segments.append(segment)
     
-    # Transporteur → Transit
+    # Transporteur → Transit → (arrivée du transit, camion vide)
     for depart_idx, arrivee_idx in transit_indices:
         segment = {
             'type': 'debut_transit',
@@ -496,20 +504,10 @@ def creer_segments_possibles(collecte_indices, livraison_indices, transit_indice
             segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
             segments.append(segment)
     
-    # Site → Transit → Site
-    for depart_idx, arrivee_idx in transit_indices:
-        segment = {
-            'type': 'site_transit_site',
-            'arrets': [1, depart_idx, arrivee_idx, 1],
-            'distance': (distance_matrix[1][depart_idx] +
-                       distance_matrix[depart_idx][arrivee_idx] +
-                       distance_matrix[arrivee_idx][1]),
-            'info_transit': location_info[depart_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
-        segments.append(segment)
+    # Site → Transit → Site  ← SUPPRIMÉ (après transit le camion est vide, rien à décharger au site)
+    # Ce segment n'existe plus. À la place on a :
     
-    # Site → Transit → Collecte → Site
+    # Site → Transit → Collecte → Site (le camion enchaîne une collecte après le transit)
     for depart_idx, arrivee_idx in transit_indices:
         for col_idx in collecte_indices:
             segment = {
@@ -525,37 +523,18 @@ def creer_segments_possibles(collecte_indices, livraison_indices, transit_indice
             segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
             segments.append(segment)
     
-    # Site → Livraison → Transit → Site
-    for liv_idx in livraison_indices:
-        for depart_idx, arrivee_idx in transit_indices:
-            segment = {
-                'type': 'livraison_transit_site',
-                'arrets': [1, liv_idx, depart_idx, arrivee_idx, 1],
-                'distance': (distance_matrix[1][liv_idx] +
-                           distance_matrix[liv_idx][depart_idx] +
-                           distance_matrix[depart_idx][arrivee_idx] +
-                           distance_matrix[arrivee_idx][1]),
-                'info_livraison': location_info[liv_idx],
-                'info_transit': location_info[depart_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
-    
-    # Site → Livraison → Transit → Transporteur (fin directe, sans retour au site)
-    for liv_idx in livraison_indices:
-        for depart_idx, arrivee_idx in transit_indices:
-            segment = {
-                'type': 'livraison_transit_fin',
-                'arrets': [1, liv_idx, depart_idx, arrivee_idx, 0],
-                'distance': (distance_matrix[1][liv_idx] +
-                           distance_matrix[liv_idx][depart_idx] +
-                           distance_matrix[depart_idx][arrivee_idx] +
-                           distance_matrix[arrivee_idx][0]),
-                'info_livraison': location_info[liv_idx],
-                'info_transit': location_info[depart_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
+    # Site → Transit → Transporteur (fin de tournée après transit)
+    for depart_idx, arrivee_idx in transit_indices:
+        segment = {
+            'type': 'site_transit_fin',
+            'arrets': [1, depart_idx, arrivee_idx, 0],
+            'distance': (distance_matrix[1][depart_idx] +
+                       distance_matrix[depart_idx][arrivee_idx] +
+                       distance_matrix[arrivee_idx][0]),
+            'info_transit': location_info[depart_idx]
+        }
+        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
+        segments.append(segment)
     
     # Site → Livraison → Transit → Collecte → Site
     for liv_idx in livraison_indices:
@@ -576,18 +555,55 @@ def creer_segments_possibles(collecte_indices, livraison_indices, transit_indice
                 segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (4 * TEMPS_OPERATION_HEURES)
                 segments.append(segment)
     
+    # Site → Livraison → Transit → Transporteur (fin directe)
+    for liv_idx in livraison_indices:
+        for depart_idx, arrivee_idx in transit_indices:
+            segment = {
+                'type': 'livraison_transit_fin',
+                'arrets': [1, liv_idx, depart_idx, arrivee_idx, 0],
+                'distance': (distance_matrix[1][liv_idx] +
+                           distance_matrix[liv_idx][depart_idx] +
+                           distance_matrix[depart_idx][arrivee_idx] +
+                           distance_matrix[arrivee_idx][0]),
+                'info_livraison': location_info[liv_idx],
+                'info_transit': location_info[depart_idx]
+            }
+            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
+            segments.append(segment)
+    
     # Transit → Transit (enchaînement depuis le site)
+    # Après le 2ème transit le camion est vide → pas de retour au site.
+    # À la place : site → transit1 → transit2 → collecte → site
     for depart_idx1, arrivee_idx1 in transit_indices:
         for depart_idx2, arrivee_idx2 in transit_indices:
             if location_info[depart_idx1]['transit_id'] != location_info[depart_idx2]['transit_id']:
+                # Site → Transit1 → Transit2 → Collecte → Site
+                for col_idx in collecte_indices:
+                    segment = {
+                        'type': 'transit_transit_collecte',
+                        'arrets': [1, depart_idx1, arrivee_idx1, depart_idx2, arrivee_idx2, col_idx, 1],
+                        'distance': (distance_matrix[1][depart_idx1] +
+                                   distance_matrix[depart_idx1][arrivee_idx1] +
+                                   distance_matrix[arrivee_idx1][depart_idx2] +
+                                   distance_matrix[depart_idx2][arrivee_idx2] +
+                                   distance_matrix[arrivee_idx2][col_idx] +
+                                   distance_matrix[col_idx][1]),
+                        'info_transit1': location_info[depart_idx1],
+                        'info_transit2': location_info[depart_idx2],
+                        'info_collecte': location_info[col_idx]
+                    }
+                    segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (5 * TEMPS_OPERATION_HEURES)
+                    segments.append(segment)
+                
+                # Site → Transit1 → Transit2 → Transporteur (fin)
                 segment = {
-                    'type': 'transit_transit_site',
-                    'arrets': [1, depart_idx1, arrivee_idx1, depart_idx2, arrivee_idx2, 1],
+                    'type': 'transit_transit_fin',
+                    'arrets': [1, depart_idx1, arrivee_idx1, depart_idx2, arrivee_idx2, 0],
                     'distance': (distance_matrix[1][depart_idx1] +
                                distance_matrix[depart_idx1][arrivee_idx1] +
                                distance_matrix[arrivee_idx1][depart_idx2] +
                                distance_matrix[depart_idx2][arrivee_idx2] +
-                               distance_matrix[arrivee_idx2][1]),
+                               distance_matrix[arrivee_idx2][0]),
                     'info_transit1': location_info[depart_idx1],
                     'info_transit2': location_info[depart_idx2]
                 }
@@ -771,7 +787,10 @@ def filtrer_segments_par_date(segments, date_candidate, location_info,
 def construire_meilleure_sequence(segments, collecte_indices, livraison_indices, transit_indices,
                                   location_info, duree_max_heures, date_candidate):
     """
-    Construit la meilleure séquence de segments pour une date donnée
+    Construit la meilleure séquence de segments pour une date donnée.
+    
+    Après un transit le camion est vide : les segments qui finissent
+    au transporteur (index 0) sont des fins de tournée valides.
     """
     
     collectes_restantes = set(collecte_indices)
@@ -856,21 +875,13 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                 elif seg['type'] == 'livraison_collecte':
                     if seg['arrets'][1] in livraisons_restantes and seg['arrets'][2] in collectes_restantes:
                         ajouter = True
-                elif seg['type'] == 'site_transit_site':
-                    transit_id = location_info[seg['arrets'][1]]['transit_id']
-                    if transit_id in transits_restants:
-                        ajouter = True
                 elif seg['type'] == 'site_transit_collecte':
                     transit_id = location_info[seg['arrets'][1]]['transit_id']
                     if transit_id in transits_restants and seg['arrets'][3] in collectes_restantes:
                         ajouter = True
-                elif seg['type'] == 'livraison_transit_site':
-                    transit_id = location_info[seg['arrets'][2]]['transit_id']
-                    if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
-                        ajouter = True
-                elif seg['type'] == 'livraison_transit_fin':
-                    transit_id = location_info[seg['arrets'][2]]['transit_id']
-                    if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
+                elif seg['type'] == 'site_transit_fin':
+                    transit_id = location_info[seg['arrets'][1]]['transit_id']
+                    if transit_id in transits_restants:
                         ajouter = True
                 elif seg['type'] == 'livraison_transit_collecte':
                     transit_id = location_info[seg['arrets'][2]]['transit_id']
@@ -878,7 +889,16 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                         transit_id in transits_restants and
                         seg['arrets'][4] in collectes_restantes):
                         ajouter = True
-                elif seg['type'] == 'transit_transit_site':
+                elif seg['type'] == 'livraison_transit_fin':
+                    transit_id = location_info[seg['arrets'][2]]['transit_id']
+                    if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
+                        ajouter = True
+                elif seg['type'] == 'transit_transit_collecte':
+                    tid1 = location_info[seg['arrets'][1]]['transit_id']
+                    tid2 = location_info[seg['arrets'][3]]['transit_id']
+                    if tid1 in transits_restants and tid2 in transits_restants and seg['arrets'][5] in collectes_restantes:
+                        ajouter = True
+                elif seg['type'] == 'transit_transit_fin':
                     tid1 = location_info[seg['arrets'][1]]['transit_id']
                     tid2 = location_info[seg['arrets'][3]]['transit_id']
                     if tid1 in transits_restants and tid2 in transits_restants:
@@ -896,8 +916,13 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         if not segments_possibles:
             break
         
-        # Trier : privilégier les segments avec le plus de trajets, puis par distance
+        # Trier : privilégier les segments avec le plus de trajets, puis par distance.
+        # Les segments finissant au transporteur (index 0) sont déprioritisés
+        # sauf s'il n'y a plus d'autres trajets à faire après.
+        reste_a_faire = len(collectes_restantes) + len(livraisons_restantes) + len(transits_restants)
         segments_possibles.sort(key=lambda x: (
+            # Si plus d'un trajet à faire, on préfère ne pas finir au transporteur
+            1 if (x['arrets'][-1] == 0 and reste_a_faire > self_count_trajets(x, location_info)) else 0,
             -len([a for a in x['arrets'] if a not in [0, 1]]),
             x['distance']
         ))
@@ -919,12 +944,12 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         
         position_actuelle = seg['arrets'][-1]
         
-        # Si le segment se termine au transporteur (type fin), on sort de la boucle
+        # Si le segment se termine au transporteur, fin de tournée
         if position_actuelle == 0:
             break
     
     # 3. FIN
-    # Si on est déjà au transporteur (ex: livraison_transit_fin), pas besoin d'ajouter un segment de fin
+    # Si on est déjà au transporteur (segment _fin), pas besoin d'ajouter un segment de fin
     if position_actuelle == 0:
         nb_trajets_couverts = (
             len(collecte_indices) - len(collectes_restantes) +
@@ -946,7 +971,7 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
             'duree_max_heures': duree_max_heures
         }
     
-    # Sinon on cherche un segment de fin
+    # Sinon on cherche un segment de fin depuis la position actuelle
     segments_fin = [s for s in segments if s['type'] in [
         'fin_depuis_site', 'fin_depuis_livraison', 'fin_depuis_transit'
     ]]
@@ -992,6 +1017,17 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         'transits_restants': transits_restants,
         'duree_max_heures': duree_max_heures
     }
+
+def self_count_trajets(segment, location_info):
+    """Compte le nombre de trajets utiles dans un segment (hors transporteur et site)"""
+    count = 0
+    for arret_idx in segment['arrets']:
+        if arret_idx not in [0, 1]:
+            info = location_info[arret_idx]
+            # On compte une fois par trajet : collecte, livraison, transit_depart
+            if info['type'] in ['collecte', 'livraison', 'transit_depart']:
+                count += 1
+    return count
 
 # ==================== FORMATAGE DE LA SOLUTION ====================
 
