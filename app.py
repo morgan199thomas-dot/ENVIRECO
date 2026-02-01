@@ -541,6 +541,22 @@ def creer_segments_possibles(collecte_indices, livraison_indices, transit_indice
             segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
             segments.append(segment)
     
+    # Site → Livraison → Transit → Transporteur (fin directe, sans retour au site)
+    for liv_idx in livraison_indices:
+        for depart_idx, arrivee_idx in transit_indices:
+            segment = {
+                'type': 'livraison_transit_fin',
+                'arrets': [1, liv_idx, depart_idx, arrivee_idx, 0],
+                'distance': (distance_matrix[1][liv_idx] +
+                           distance_matrix[liv_idx][depart_idx] +
+                           distance_matrix[depart_idx][arrivee_idx] +
+                           distance_matrix[arrivee_idx][0]),
+                'info_livraison': location_info[liv_idx],
+                'info_transit': location_info[depart_idx]
+            }
+            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
+            segments.append(segment)
+    
     # Site → Livraison → Transit → Collecte → Site
     for liv_idx in livraison_indices:
         for depart_idx, arrivee_idx in transit_indices:
@@ -852,6 +868,10 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                     transit_id = location_info[seg['arrets'][2]]['transit_id']
                     if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
                         ajouter = True
+                elif seg['type'] == 'livraison_transit_fin':
+                    transit_id = location_info[seg['arrets'][2]]['transit_id']
+                    if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
+                        ajouter = True
                 elif seg['type'] == 'livraison_transit_collecte':
                     transit_id = location_info[seg['arrets'][2]]['transit_id']
                     if (seg['arrets'][1] in livraisons_restantes and
@@ -876,10 +896,10 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         if not segments_possibles:
             break
         
-        # Trier : privilégier les segments avec le plus de trajets
+        # Trier : privilégier les segments avec le plus de trajets, puis par distance
         segments_possibles.sort(key=lambda x: (
             -len([a for a in x['arrets'] if a not in [0, 1]]),
-            x['duree_heures']
+            x['distance']
         ))
         
         seg = segments_possibles[0]
@@ -898,8 +918,35 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                 transits_restants.discard(info['transit_id'])
         
         position_actuelle = seg['arrets'][-1]
+        
+        # Si le segment se termine au transporteur (type fin), on sort de la boucle
+        if position_actuelle == 0:
+            break
     
     # 3. FIN
+    # Si on est déjà au transporteur (ex: livraison_transit_fin), pas besoin d'ajouter un segment de fin
+    if position_actuelle == 0:
+        nb_trajets_couverts = (
+            len(collecte_indices) - len(collectes_restantes) +
+            len(livraison_indices) - len(livraisons_restantes) +
+            len(transit_indices) - len(transits_restants)
+        )
+        
+        print(f"      📊 {len(sequence)} segments, {nb_trajets_couverts} trajets, {duree_totale:.1f}h, {distance_totale/1000:.1f}km")
+        
+        return {
+            'date': date_candidate,
+            'sequence': sequence,
+            'nb_trajets_couverts': nb_trajets_couverts,
+            'duree_totale': duree_totale,
+            'distance_totale': distance_totale,
+            'collectes_restantes': collectes_restantes,
+            'livraisons_restantes': livraisons_restantes,
+            'transits_restants': transits_restants,
+            'duree_max_heures': duree_max_heures
+        }
+    
+    # Sinon on cherche un segment de fin
     segments_fin = [s for s in segments if s['type'] in [
         'fin_depuis_site', 'fin_depuis_livraison', 'fin_depuis_transit'
     ]]
@@ -1175,4 +1222,5 @@ if __name__ == '__main__':
     if gmaps is None:
         print("⚠️  Google Maps non configuré - Distances estimées seront utilisées")
         print("💡 Ajoutez votre clé API Google Maps pour vraies distances")
+
     app.run(host='0.0.0.0', port=5000, debug=True)
