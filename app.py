@@ -807,35 +807,53 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         'debut_collecte', 'debut_site', 'debut_transit', 'debut_transit_collecte'
     ]]
     
+    print(f"\n🔍 DEBUG DÉBUT: {len(segments_debut)} segments de début trouvés")
+    for seg in segments_debut:
+        print(f"   - {seg['type']}: arrets={seg['arrets']}, durée={seg['duree_heures']:.2f}h")
+    
     # Privilégier les segments utiles (debut_site en dernier)
     segments_debut_tries = sorted(segments_debut, key=lambda x: (
         0 if x['type'] == 'debut_site' else -1,
         x['duree_heures']
     ))
     
+    print(f"\n🔍 DEBUG TRI: Ordre après tri:")
+    for i, seg in enumerate(segments_debut_tries):
+        print(f"   {i+1}. {seg['type']}: priorité={0 if seg['type'] == 'debut_site' else -1}, durée={seg['duree_heures']:.2f}h")
+    
     segment_choisi = None
     for seg in segments_debut_tries:
+        print(f"\n🔍 DEBUG TEST: {seg['type']} (durée={seg['duree_heures']:.2f}h, max={duree_max_heures})")
         if duree_max_heures is None or seg['duree_heures'] <= duree_max_heures:
             valide = True
             if seg['type'] == 'debut_collecte':
                 if seg['arrets'][1] not in collectes_restantes:
                     valide = False
+                    print(f"   ❌ Collecte non disponible")
             elif seg['type'] == 'debut_transit':
                 transit_id = location_info[seg['arrets'][1]]['transit_id']
+                print(f"   → transit_id={transit_id}, transits_restants={transits_restants}")
                 if transit_id not in transits_restants:
                     valide = False
+                    print(f"   ❌ Transit non disponible")
             elif seg['type'] == 'debut_transit_collecte':
                 transit_id = location_info[seg['arrets'][1]]['transit_id']
                 if transit_id not in transits_restants or seg['arrets'][3] not in collectes_restantes:
                     valide = False
+                    print(f"   ❌ Transit ou collecte non disponible")
             elif seg['type'] == 'debut_site':
                 # debut_site n'est valide que s'il reste des trajets à faire depuis le site
                 if not (collectes_restantes or livraisons_restantes or transits_restants):
                     valide = False
+                    print(f"   ❌ Aucun trajet restant")
             
+            print(f"   → valide={valide}")
             if valide:
                 segment_choisi = seg
+                print(f"   ✅ CHOISI: {seg['type']}")
                 break
+        else:
+            print(f"   ❌ Dépasse durée max")
     
     if not segment_choisi:
         return None
