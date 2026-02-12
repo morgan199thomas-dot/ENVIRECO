@@ -882,11 +882,16 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
     max_iterations = 20
     iterations = 0
     
+    print(f"\n🔍 DEBUG MILIEU: Position après début = {position_actuelle}")
+    print(f"   Reste: {len(collectes_restantes)} collectes, {len(livraisons_restantes)} livraisons, {len(transits_restants)} transits")
+    
     while (collectes_restantes or livraisons_restantes or transits_restants) and iterations < max_iterations:
         iterations += 1
+        print(f"\n🔍 DEBUG MILIEU Iteration {iterations}: position={position_actuelle}")
         segments_possibles = []
         
         if position_actuelle == 1:  # Au site
+            print(f"   → Au site (index 1)")
             for seg in segments:
                 ajouter = False
                 
@@ -932,22 +937,33 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
         else:  # Position autre que site (ex: arrivée d'un transit)
             # Chercher des segments qui partent de cette position
             # Typiquement : segments de collecte ou retour au site/transporteur
+            print(f"   → Autre position (index {position_actuelle}, pas au site)")
+            print(f"   → Cherche segments commençant par index {position_actuelle}")
+            segments_testés = 0
             for seg in segments:
                 # Le segment doit commencer par notre position actuelle
                 if len(seg['arrets']) > 0 and seg['arrets'][0] == position_actuelle:
+                    segments_testés += 1
+                    print(f"      Segment trouvé: {seg['type']}, arrets={seg['arrets']}")
                     ajouter = False
                     
                     # Vérifier que les trajets du segment sont encore disponibles
                     if seg['type'] == 'fin_depuis_transit':
                         ajouter = True
+                        print(f"         → fin_depuis_transit → ajouter=True")
                     elif 'collecte' in seg['type']:
                         # Vérifier si les collectes sont disponibles
                         collectes_seg = [a for a in seg['arrets'] if a in collectes_restantes]
                         if collectes_seg:
                             ajouter = True
+                        print(f"         → collecte segment, collectes dispo={collectes_seg} → ajouter={ajouter}")
                     
                     if ajouter:
                         segments_possibles.append(seg)
+            
+            print(f"   → {segments_testés} segments testés commençant par {position_actuelle}")
+        
+        print(f"   → {len(segments_possibles)} segments possibles trouvés")
         
         # Filtrer par durée
         segments_possibles = [
@@ -955,7 +971,10 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
             if duree_max_heures is None or (duree_totale + s['duree_heures']) <= duree_max_heures
         ]
         
+        print(f"   → {len(segments_possibles)} segments après filtrage durée")
+        
         if not segments_possibles:
+            print(f"   ❌ Aucun segment possible, sortie de la boucle")
             break
         
         # Trier : privilégier les segments avec le plus de trajets, puis par distance.
