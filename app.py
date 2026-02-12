@@ -869,8 +869,8 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
     elif segment_choisi['type'] == 'debut_site':
         position_actuelle = 1
     elif segment_choisi['type'] == 'debut_transit':
-        transit_id = location_info[segment_choisi['arrets'][1]]['transit_id']
-        transits_restants.discard(transit_id)
+        # NE PAS marquer le transit comme utilisé ici !
+        # Il sera marqué dans la boucle du milieu après qu'on ait quitté l'arrivée
         position_actuelle = segment_choisi['arrets'][-1]
     elif segment_choisi['type'] == 'debut_transit_collecte':
         transit_id = location_info[segment_choisi['arrets'][1]]['transit_id']
@@ -1002,6 +1002,13 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
             info = location_info[arret_idx]
             if info['type'] == 'transit_depart':
                 transits_restants.discard(info['transit_id'])
+        
+        # Si on quitte une position qui est une arrivée de transit, marquer ce transit comme utilisé
+        if position_actuelle not in [0, 1]:  # Pas transporteur ni site
+            info_position = location_info[position_actuelle]
+            if info_position['type'] == 'transit_arrivee':
+                transits_restants.discard(info_position['transit_id'])
+                print(f"   → Quitte arrivée transit {info_position['transit_id']}, marqué comme utilisé")
         
         position_actuelle = seg['arrets'][-1]
         
