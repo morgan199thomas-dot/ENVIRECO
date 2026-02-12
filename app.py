@@ -828,6 +828,10 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                 transit_id = location_info[seg['arrets'][1]]['transit_id']
                 if transit_id not in transits_restants or seg['arrets'][3] not in collectes_restantes:
                     valide = False
+            elif seg['type'] == 'debut_site':
+                # debut_site n'est valide que s'il reste des trajets à faire depuis le site
+                if not (collectes_restantes or livraisons_restantes or transits_restants):
+                    valide = False
             
             if valide:
                 segment_choisi = seg
