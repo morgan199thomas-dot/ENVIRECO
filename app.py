@@ -907,6 +907,26 @@ def construire_meilleure_sequence(segments, collecte_indices, livraison_indices,
                 if ajouter:
                     segments_possibles.append(seg)
         
+        else:  # Position autre que site (ex: arrivée d'un transit)
+            # Chercher des segments qui partent de cette position
+            # Typiquement : segments de collecte ou retour au site/transporteur
+            for seg in segments:
+                # Le segment doit commencer par notre position actuelle
+                if len(seg['arrets']) > 0 and seg['arrets'][0] == position_actuelle:
+                    ajouter = False
+                    
+                    # Vérifier que les trajets du segment sont encore disponibles
+                    if seg['type'] == 'fin_depuis_transit':
+                        ajouter = True
+                    elif 'collecte' in seg['type']:
+                        # Vérifier si les collectes sont disponibles
+                        collectes_seg = [a for a in seg['arrets'] if a in collectes_restantes]
+                        if collectes_seg:
+                            ajouter = True
+                    
+                    if ajouter:
+                        segments_possibles.append(seg)
+        
         # Filtrer par durée
         segments_possibles = [
             s for s in segments_possibles
