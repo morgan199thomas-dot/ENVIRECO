@@ -2,311 +2,229 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 import googlemaps
 import os
+import time
+import json
+import math
+import sys
+
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+try:
+    if sys.stdout.encoding != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 app = Flask(__name__)
 
-# Configuration Google Maps
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', 'AIzaSyAI-VXfNrlF7RmK9ED7Eo6_FMfxYWyE-nU')
 gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY) if GOOGLE_MAPS_API_KEY != 'VOTRE_CLE_API_ICI' else None
 
-# ==================== VALIDATION ET FILTRAGE ====================
+CHUNK_SIZE = 20
+CACHE_FILE = 'distances_cache.json'
+
+# =============================================================================
+# REGLES METIER
+#
+#   Livraison  : site -> livraison -> (collecte | debut_transit | site)
+#   Collecte   : (site | fin_transit | livraison) -> collecte -> site
+#   Transit    : (site | livraison) -> debut_transit -> fin_transit
+#                                   -> (site | collecte | debut_transit)
+#   Boucle     : Transporteur -> Site -> [atomes] -> Site -> Transporteur
+#
+# Un atome est un chemin complet Site -> ... -> Site.
+# La tournee est une sequence d'atomes independants.
+#
+# Les atomes sont construits DYNAMIQUEMENT (pas de pre-generation)
+# pour eviter l'explosion combinatoire N! avec N transits.
+# =============================================================================
+
+# ==================== VALIDATION ====================
 
 def valider_collecte(c):
-    """Vérifie qu'une collecte a les données minimales requises"""
-    if not c.get('adresse') or c['adresse'].strip() == '':
-        return False
-    if not c.get('client') or c['client'].strip() == '':
-        return False
-    return True
+    return bool(c.get('adresse', '').strip()) and bool(c.get('client', '').strip())
 
 def valider_livraison(l):
-    """Vérifie qu'une livraison a les données minimales requises"""
-    if not l.get('adresse') or l['adresse'].strip() == '':
-        return False
-    if not l.get('client') or l['client'].strip() == '':
-        return False
-    return True
+    return bool(l.get('adresse', '').strip()) and bool(l.get('client', '').strip())
 
 def valider_transit(t):
-    """Vérifie qu'un transit a les données minimales requises"""
-    if not t.get('adresse_depart') or t['adresse_depart'].strip() == '':
-        return False
-    if not t.get('adresse_arrivee') or t['adresse_arrivee'].strip() == '':
-        return False
-    if not t.get('matiere_transit') or t['matiere_transit'].strip() == '':
-        return False
-    return True
+    return (bool(t.get('adresse_depart', '').strip()) and
+            bool(t.get('adresse_arrivee', '').strip()) and
+            bool(t.get('matiere_transit', '').strip()))
 
 def valider_transporteur(t):
-    """Vérifie qu'un transporteur a les données minimales requises"""
-    if not t.get('adresse') or t['adresse'].strip() == '':
-        return False
-    if not t.get('client') or t['client'].strip() == '':
-        return False
-    if not t.get('ID_transporteur') or t['ID_transporteur'].strip() == '':
-        return False
-    return True
+    return (bool(t.get('adresse', '').strip()) and
+            bool(t.get('client', '').strip()) and
+            bool(t.get('ID_transporteur', '').strip()))
 
 def filtrer_donnees(collectes, livraisons, transits, transporteurs):
-    """Filtre toutes les entrées vides ou invalides"""
-    collectes_valides = [c for c in collectes if valider_collecte(c)]
-    livraisons_valides = [l for l in livraisons if valider_livraison(l)]
-    transits_valides = [t for t in transits if valider_transit(t)]
-    transporteurs_valides = [t for t in transporteurs if valider_transporteur(t)]
-    
-    print(f"\n🔍 Filtrage des données:")
-    print(f"   Collectes: {len(collectes)} → {len(collectes_valides)} valides")
-    print(f"   Livraisons: {len(livraisons)} → {len(livraisons_valides)} valides")
-    print(f"   Transits: {len(transits)} → {len(transits_valides)} valides")
-    print(f"   Transporteurs: {len(transporteurs)} → {len(transporteurs_valides)} valides")
-    
-    return collectes_valides, livraisons_valides, transits_valides, transporteurs_valides
+    cv = [c for c in collectes if valider_collecte(c)]
+    lv = [l for l in livraisons if valider_livraison(l)]
+    tv = [t for t in transits if valider_transit(t)]
+    trv = [t for t in transporteurs if valider_transporteur(t)]
+    print(f"\nFiltrage: collectes {len(collectes)}->{len(cv)}, "
+          f"livraisons {len(livraisons)}->{len(lv)}, "
+          f"transits {len(transits)}->{len(tv)}, "
+          f"transporteurs {len(transporteurs)}->{len(trv)}")
+    return cv, lv, tv, trv
 
 # ==================== ENDPOINTS ====================
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Test simple pour vérifier que l'API fonctionne"""
     return jsonify({
         "status": "OK",
-        "message": "API OR-Tools opérationnelle !",
+        "message": "API operationnelle",
         "google_maps_configured": gmaps is not None
     })
 
 @app.route('/optimize', methods=['POST'])
 def optimize_route():
-    """Point d'entrée principal"""
     try:
         data = request.json
-        print("📥 Données reçues:", data)
-        
-        collectes = data.get('collectes', [])
-        livraisons = data.get('livraisons', [])
-        transits = data.get('Transits', [])
+        collectes    = data.get('collectes', [])
+        livraisons   = data.get('livraisons', [])
+        transits     = data.get('Transits', [])
         transporteurs = data.get('Transporteurs', [])
-        site = data.get('site_traitement', {})
-        contraintes = data.get('contraintes', {})
-        
-        # Filtrer les données vides
+        site         = data.get('site_traitement', {})
+        contraintes  = data.get('contraintes', {})
+
         collectes, livraisons, transits, transporteurs = filtrer_donnees(
-            collectes, livraisons, transits, transporteurs
-        )
-        
+            collectes, livraisons, transits, transporteurs)
+
         if not transporteurs:
-            return jsonify({
-                "error": "Aucun transporteur valide",
-                "details": "Veuillez fournir au moins un transporteur avec des données complètes"
-            }), 400
-        
+            return jsonify({"error": "Aucun transporteur valide"}), 400
         if not collectes and not livraisons and not transits:
-            return jsonify({
-                "error": "Aucun trajet valide",
-                "details": "Veuillez fournir au moins un trajet avec des données complètes"
-            }), 400
-        
-        # Optimisation
-        solution = optimize_with_transporteurs(collectes, livraisons, transits, transporteurs, site, contraintes)
-        
-        print("✅ Solution calculée")
+            return jsonify({"error": "Aucun trajet valide"}), 400
+
+        solution = optimize_with_transporteurs(
+            collectes, livraisons, transits, transporteurs, site, contraintes)
         return jsonify(solution)
-    
+
     except Exception as e:
-        print("❌ Erreur:", str(e))
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 400
 
 # ==================== OPTIMISATION PRINCIPALE ====================
 
 def optimize_with_transporteurs(collectes, livraisons, transits, transporteurs, site, contraintes):
-    """
-    Optimise en testant chaque transporteur
-    Tient compte des collectes avec transporteur imposé
-    """
-    
-    print(f"\n🚚 Test de {len(transporteurs)} transporteur(s)")
-    
-    solutions_par_transporteur = []
-    
+    solutions = []
+
     for transporteur in transporteurs:
         print(f"\n{'='*60}")
-        print(f"🚚 Test du transporteur: {transporteur['client']} (ID: {transporteur['ID_transporteur']})")
-        print(f"{'='*60}")
-        
-        # Filtrer les collectes selon le transporteur
-        collectes_pour_ce_transporteur = []
-        collectes_incompatibles = []
-        
+        print(f"Transporteur: {transporteur['client']} ({transporteur['ID_transporteur']})")
+
+        collectes_ok  = []
+        collectes_nok = []
         for c in collectes:
-            transporteur_impose = c.get('transporteur', '').strip()
-            
-            if transporteur_impose == '':
-                # Pas de transporteur imposé, libre
-                collectes_pour_ce_transporteur.append(c)
-            elif transporteur_impose == transporteur['ID_transporteur']:
-                # Transporteur imposé correspond
-                collectes_pour_ce_transporteur.append(c)
+            imp = c.get('transporteur', '').strip()
+            if imp == '' or imp == transporteur['ID_transporteur']:
+                collectes_ok.append(c)
             else:
-                # Transporteur imposé ne correspond pas
-                collectes_incompatibles.append(c)
-                print(f"   ❌ Collecte {c.get('ID_entree', 'N/A')} incompatible (impose transporteur {transporteur_impose})")
-        
-        solution = calculate_route_with_transporteur(
-            collectes_pour_ce_transporteur, livraisons, transits,
-            transporteur, site, contraintes
-        )
-        
-        if solution.get('success'):
-            # Ajouter les collectes incompatibles aux trajets non inclus
-            if collectes_incompatibles:
-                if 'trajets_non_inclus' not in solution:
-                    solution['trajets_non_inclus'] = []
-                
-                for c in collectes_incompatibles:
-                    solution['trajets_non_inclus'].append({
+                collectes_nok.append(c)
+                print(f"  Collecte {c.get('ID_entree','?')} incompatible (impose {imp})")
+
+        sol = calculate_route_with_transporteur(
+            collectes_ok, livraisons, transits, transporteur, site, contraintes)
+
+        if sol.get('success'):
+            # Ajouter collectes incompatibles aux non-inclus
+            if collectes_nok:
+                sol.setdefault('trajets_non_inclus', [])
+                for c in collectes_nok:
+                    sol['trajets_non_inclus'].append({
                         'type': 'collecte',
                         'ID_entree': c.get('ID_entree', ''),
                         'client': c.get('client', ''),
-                        'raison': f"Transporteur incompatible (impose {c.get('transporteur', '')})"
+                        'raison': f"Transporteur incompatible (impose {c.get('transporteur','')})"
                     })
-                
-                # Recalculer le taux de complétion
                 nb_total = len(collectes) + len(livraisons) + len(transits)
-                nb_inclus = nb_total - len(solution['trajets_non_inclus'])
-                solution['statistiques']['nombre_collectes_totales'] = len(collectes)
-                solution['statistiques']['taux_completion'] = f"{(nb_inclus / nb_total * 100):.0f}%" if nb_total > 0 else "0%"
-                solution['avertissement'] = f"{len(solution['trajets_non_inclus'])} trajet(s) non inclus"
-            
-            solutions_par_transporteur.append({
-                'transporteur': transporteur,
-                'solution': solution
-            })
-    
-    if not solutions_par_transporteur:
-        return {
-            "error": "Aucune solution trouvée",
-            "details": "Aucun transporteur ne permet de satisfaire les contraintes"
-        }
-    
-    # Choisir le meilleur transporteur
-    meilleure = max(
-        solutions_par_transporteur,
-        key=lambda x: (
-            x['solution']['statistiques']['nombre_collectes_incluses'] +
-            x['solution']['statistiques']['nombre_livraisons_incluses'] +
-            x['solution']['statistiques']['nombre_transits_inclus'],
-            -x['solution']['statistiques']['distance_totale_km'],
-            -x['solution']['statistiques']['duree_totale_heures']
-        )
-    )
-    
-    print(f"\n{'='*60}")
-    print(f"🏆 MEILLEUR TRANSPORTEUR: {meilleure['transporteur']['client']}")
-    print(f"{'='*60}")
-    
+                nb_inclus = nb_total - len(sol['trajets_non_inclus'])
+                sol['statistiques']['taux_completion'] = (
+                    f"{nb_inclus/nb_total*100:.0f}%" if nb_total > 0 else "0%")
+
+            solutions.append({'transporteur': transporteur, 'solution': sol})
+
+    if not solutions:
+        return {"error": "Aucune solution trouvee"}
+
+    def score(s):
+        st = s['solution']['statistiques']
+        return (st['nombre_collectes_incluses'] +
+                st['nombre_livraisons_incluses'] +
+                st['nombre_transits_inclus'],
+                -st['distance_totale_km'],
+                -st['duree_totale_heures'])
+
+    meilleure = max(solutions, key=score)
     result = meilleure['solution']
     result['transporteur_optimal'] = {
         'ID_transporteur': meilleure['transporteur']['ID_transporteur'],
         'nom': meilleure['transporteur']['client'],
         'adresse': meilleure['transporteur']['adresse']
     }
-    
-    # Comparaison avec autres transporteurs
-    if len(solutions_par_transporteur) > 1:
+
+    if len(solutions) > 1:
         comparaisons = []
-        for sol in solutions_par_transporteur:
-            if sol['transporteur']['ID_transporteur'] != meilleure['transporteur']['ID_transporteur']:
+        for s in solutions:
+            if s['transporteur']['ID_transporteur'] != meilleure['transporteur']['ID_transporteur']:
+                st = s['solution']['statistiques']
                 comparaisons.append({
-                    'ID_transporteur': sol['transporteur']['ID_transporteur'],
-                    'nom': sol['transporteur']['client'],
-                    'distance_km': sol['solution']['statistiques']['distance_totale_km'],
-                    'duree_heures': sol['solution']['statistiques']['duree_totale_heures'],
-                    'trajets_couverts': (
-                        sol['solution']['statistiques']['nombre_collectes_incluses'] +
-                        sol['solution']['statistiques']['nombre_livraisons_incluses'] +
-                        sol['solution']['statistiques']['nombre_transits_inclus']
-                    )
+                    'ID_transporteur': s['transporteur']['ID_transporteur'],
+                    'nom': s['transporteur']['client'],
+                    'distance_km': st['distance_totale_km'],
+                    'duree_heures': st['duree_totale_heures'],
+                    'trajets_couverts': (st['nombre_collectes_incluses'] +
+                                        st['nombre_livraisons_incluses'] +
+                                        st['nombre_transits_inclus'])
                 })
-        
         result['transporteurs_alternatifs'] = comparaisons
-        
-        meilleure_distance = result['statistiques']['distance_totale_km']
-        if comparaisons:
-            autre_distance = comparaisons[0]['distance_km']
-            economie = autre_distance - meilleure_distance
-            result['transporteur_optimal']['raison'] = (
-                f"Économie de {economie:.1f} km par rapport aux alternatives"
-            )
-    
+
     return result
 
 # ==================== CALCUL DE ROUTE ====================
 
 def calculate_route_with_transporteur(collectes, livraisons, transits, transporteur, site, contraintes):
-    """
-    Calcule la tournée optimale pour UN transporteur donné
-    """
-    
-    locations = []
-    location_info = []
-    
-    # Transporteur (index 0)
-    locations.append(transporteur['adresse'])
-    location_info.append({
-        'type': 'transporteur',
-        'nom': transporteur['client'],
-        'adresse': transporteur['adresse'],
-        'ID_transporteur': transporteur['ID_transporteur']
-    })
-    
-    # Site de traitement (index 1)
-    locations.append(site['adresse'])
-    location_info.append({
-        'type': 'site',
-        'nom': site.get('nom', 'Site'),
-        'adresse': site['adresse']
-    })
-    
-    # Collectes
-    collecte_indices = []
+    # Index fixes : 0 = transporteur, 1 = site
+    locations    = [transporteur['adresse'], site['adresse']]
+    location_info = [
+        {'type': 'transporteur', 'nom': transporteur['client'],
+         'adresse': transporteur['adresse'],
+         'ID_transporteur': transporteur['ID_transporteur']},
+        {'type': 'site', 'nom': site.get('nom', 'Site'), 'adresse': site['adresse']}
+    ]
+
+    collecte_indices  = []
+    livraison_indices = []
+    transit_indices   = []  # liste de (depart_idx, arrivee_idx)
+
     for c in collectes:
         locations.append(c['adresse'])
         collecte_indices.append(len(locations) - 1)
         location_info.append({
-            'type': 'collecte',
-            'nom': c['client'],
-            'adresse': c['adresse'],
+            'type': 'collecte', 'nom': c['client'], 'adresse': c['adresse'],
             'ID_entree': c.get('ID_entree', ''),
             'date_fixe': c.get('date_fixe', ''),
             'date_flexible_debut': c.get('date_flexible_debut', ''),
             'date_flexible_fin': c.get('date_flexible_fin', ''),
             'transporteur': c.get('transporteur', '')
         })
-    
-    # Livraisons
-    livraison_indices = []
+
     for l in livraisons:
         locations.append(l['adresse'])
         livraison_indices.append(len(locations) - 1)
         location_info.append({
-            'type': 'livraison',
-            'nom': l['client'],
-            'adresse': l['adresse'],
+            'type': 'livraison', 'nom': l['client'], 'adresse': l['adresse'],
             'ID_sortie': l.get('ID_sortie', ''),
             'date_fixe': l.get('date_fixe', ''),
             'date_flexible_debut': l.get('date_flexible_debut', ''),
             'date_flexible_fin': l.get('date_flexible_fin', '')
         })
-    
-    # Transits
-    transit_indices = []
+
     for idx, t in enumerate(transits):
-        # Point de départ
         locations.append(t['adresse_depart'])
-        depart_idx = len(locations) - 1
+        dep_idx = len(locations) - 1
         location_info.append({
-            'type': 'transit_depart',
-            'nom': f"Transit - Chargement ({t.get('matiere_transit', '')})",
+            'type': 'transit_depart', 'nom': f"Transit chargement ({t.get('matiere_transit','')})",
             'adresse': t['adresse_depart'],
             'ID_transit': t.get('ID_transit', ''),
             'matiere': t.get('matiere_transit', ''),
@@ -315,13 +233,10 @@ def calculate_route_with_transporteur(collectes, livraisons, transits, transport
             'date_flexible_fin': t.get('date_flexible_fin', ''),
             'transit_id': idx
         })
-        
-        # Point d'arrivée
         locations.append(t['adresse_arrivee'])
-        arrivee_idx = len(locations) - 1
+        arr_idx = len(locations) - 1
         location_info.append({
-            'type': 'transit_arrivee',
-            'nom': f"Transit - Livraison ({t.get('matiere_transit', '')})",
+            'type': 'transit_arrivee', 'nom': f"Transit livraison ({t.get('matiere_transit','')})",
             'adresse': t['adresse_arrivee'],
             'ID_transit': t.get('ID_transit', ''),
             'matiere': t.get('matiere_transit', ''),
@@ -330,1001 +245,782 @@ def calculate_route_with_transporteur(collectes, livraisons, transits, transport
             'date_flexible_fin': t.get('date_flexible_fin', ''),
             'transit_id': idx
         })
-        
-        transit_indices.append((depart_idx, arrivee_idx))
-    
-    print(f"📍 {len(locations)} lieux à optimiser")
-    print(f"   - Transporteur: index 0 ({transporteur['client']})")
-    print(f"   - Site: index 1")
-    print(f"   - Collectes: {len(collecte_indices)}")
-    print(f"   - Livraisons: {len(livraison_indices)}")
-    print(f"   - Transits: {len(transit_indices)}")
-    
-    # Extraire contraintes
-    duree_max = None
-    vitesse_moyenne = 70
-    temps_operation_minutes = 30
-    
+        transit_indices.append((dep_idx, arr_idx))
+
+    print(f"  Lieux: {len(locations)} "
+          f"(col={len(collecte_indices)}, liv={len(livraison_indices)}, transit={len(transit_indices)})")
+
+    # Contraintes
+    duree_max             = None
+    vitesse_moyenne       = 70.0
+    temps_operation_min   = 30.0
+
     if contraintes:
-        if 'duree_max_en_heure' in contraintes:
-            try:
-                duree_max = float(contraintes['duree_max_en_heure'])
-                print(f"⏱️  Contrainte de durée: {duree_max}h maximum")
-            except:
-                print("⚠️  Durée max invalide, ignorée")
-        
-        if 'vitesse_moyenne_kmh' in contraintes:
-            try:
-                vitesse_moyenne = float(contraintes['vitesse_moyenne_kmh'])
-                print(f"🚗 Vitesse moyenne: {vitesse_moyenne} km/h")
-            except:
-                print("⚠️  Vitesse moyenne invalide, valeur par défaut 70 km/h utilisée")
-        
-        if 'temps_operation_minutes' in contraintes:
-            try:
-                temps_operation_minutes = float(contraintes['temps_operation_minutes'])
-                print(f"⏳ Temps opération: {temps_operation_minutes} minutes")
-            except:
-                print("⚠️  Temps opération invalide, valeur par défaut 30 min utilisée")
-    
-    params_calcul = {
+        try: duree_max = float(contraintes['duree_max_en_heure'])
+        except: pass
+        try: vitesse_moyenne = float(contraintes['vitesse_moyenne_kmh'])
+        except: pass
+        try: temps_operation_min = float(contraintes['temps_operation_minutes'])
+        except: pass
+
+    params = {
         'vitesse_moyenne_kmh': vitesse_moyenne,
-        'temps_operation_heures': temps_operation_minutes / 60
+        'temps_operation_heures': temps_operation_min / 60.0
     }
-    
-    print(f"\n📊 Paramètres de calcul:")
-    print(f"   - Vitesse moyenne: {vitesse_moyenne} km/h")
-    print(f"   - Temps opération: {temps_operation_minutes} min ({temps_operation_minutes/60:.2f}h)")
-    print(f"   - Durée max: {duree_max}h" if duree_max else "   - Durée max: Pas de limite")
-    
-    # Calculer distances
-    print("🗺️  Calcul des distances...")
+
+    print(f"  Contraintes: duree_max={duree_max}h, vitesse={vitesse_moyenne}km/h, "
+          f"op={temps_operation_min}min")
+
     distance_matrix = get_distance_matrix(locations)
-    
-    # Créer segments
-    print("\n📦 Création des segments possibles:")
-    segments = creer_segments_possibles(
+
+    # Recherche de la meilleure solution par date (atomes construits dynamiquement)
+    solution = find_best_solution(
         collecte_indices, livraison_indices, transit_indices,
-        location_info, distance_matrix, params_calcul
-    )
-    print(f"\n🔍 {len(segments)} segments générés")
-    
-    # Trouver meilleure solution
-    best_solution = find_best_solution_with_dates(
-        segments, collecte_indices, livraison_indices, transit_indices,
-        location_info, distance_matrix, duree_max
-    )
-    
-    return best_solution
+        location_info, distance_matrix, duree_max, transporteur, params)
 
-# ==================== CRÉATION DES SEGMENTS ====================
+    return solution
 
-def creer_segments_possibles(collecte_indices, livraison_indices, transit_indices, location_info, distance_matrix, params_calcul):
-    """
-    Crée tous les segments de trajet possibles.
-    
-    Règle fondamentale : après un transit le camion est VIDE.
-    Il n'y a donc jamais de retour au site après un transit,
-    car le site n'est nécessaire que pour décharger une collecte.
-    
-    Segments avec transit après livraison :
-      - Livraison → Transit → Collecte → Site  (enchaîne une collecte après)
-      - Livraison → Transit → Transporteur     (fin de tournée directe)
-    """
-    VITESSE_MOYENNE_KMH = params_calcul['vitesse_moyenne_kmh']
-    TEMPS_OPERATION_HEURES = params_calcul['temps_operation_heures']
-    
-    segments = []
-    
-    # --- SEGMENTS DE DÉBUT ---
-    
-    # Transporteur → Collecte → Site
-    for col_idx in collecte_indices:
-        segment = {
-            'type': 'debut_collecte',
-            'arrets': [0, col_idx, 1],
-            'distance': distance_matrix[0][col_idx] + distance_matrix[col_idx][1],
-            'info_collecte': location_info[col_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + TEMPS_OPERATION_HEURES
-        segments.append(segment)
-    
-    # Transporteur → Site
-    segment = {
-        'type': 'debut_site',
-        'arrets': [0, 1],
-        'distance': distance_matrix[0][1],
-        'info': None
-    }
-    segment['duree_heures'] = segment['distance'] / 1000 / VITESSE_MOYENNE_KMH
-    segments.append(segment)
-    
-    # Transporteur → Transit → (arrivée du transit, camion vide)
-    for depart_idx, arrivee_idx in transit_indices:
-        segment = {
-            'type': 'debut_transit',
-            'arrets': [0, depart_idx, arrivee_idx],
-            'distance': distance_matrix[0][depart_idx] + distance_matrix[depart_idx][arrivee_idx],
-            'info_transit': location_info[depart_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
-        segments.append(segment)
-        
-        # Transporteur → Transit → Collecte → Site
-        for col_idx in collecte_indices:
-            segment = {
-                'type': 'debut_transit_collecte',
-                'arrets': [0, depart_idx, arrivee_idx, col_idx, 1],
-                'distance': (distance_matrix[0][depart_idx] +
-                           distance_matrix[depart_idx][arrivee_idx] +
-                           distance_matrix[arrivee_idx][col_idx] +
-                           distance_matrix[col_idx][1]),
-                'info_transit': location_info[depart_idx],
-                'info_collecte': location_info[col_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
-    
-    # --- SEGMENTS DU MILIEU (depuis le site) ---
-    
-    # Site → Collecte → Site
-    for col_idx in collecte_indices:
-        segment = {
-            'type': 'collecte_simple',
-            'arrets': [1, col_idx, 1],
-            'distance': distance_matrix[1][col_idx] + distance_matrix[col_idx][1],
-            'info_collecte': location_info[col_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + TEMPS_OPERATION_HEURES
-        segments.append(segment)
-    
-    # Site → Livraison → Site
-    for liv_idx in livraison_indices:
-        segment = {
-            'type': 'livraison_simple',
-            'arrets': [1, liv_idx, 1],
-            'distance': distance_matrix[1][liv_idx] + distance_matrix[liv_idx][1],
-            'info_livraison': location_info[liv_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + TEMPS_OPERATION_HEURES
-        segments.append(segment)
-    
-    # Site → Livraison → Collecte → Site
-    for liv_idx in livraison_indices:
-        for col_idx in collecte_indices:
-            segment = {
-                'type': 'livraison_collecte',
-                'arrets': [1, liv_idx, col_idx, 1],
-                'distance': (distance_matrix[1][liv_idx] +
-                           distance_matrix[liv_idx][col_idx] +
-                           distance_matrix[col_idx][1]),
-                'info_livraison': location_info[liv_idx],
-                'info_collecte': location_info[col_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
-    
-    # Site → Transit → Site  ← SUPPRIMÉ (après transit le camion est vide, rien à décharger au site)
-    # Ce segment n'existe plus. À la place on a :
-    
-    # Site → Transit → Collecte → Site (le camion enchaîne une collecte après le transit)
-    for depart_idx, arrivee_idx in transit_indices:
-        for col_idx in collecte_indices:
-            segment = {
-                'type': 'site_transit_collecte',
-                'arrets': [1, depart_idx, arrivee_idx, col_idx, 1],
-                'distance': (distance_matrix[1][depart_idx] +
-                           distance_matrix[depart_idx][arrivee_idx] +
-                           distance_matrix[arrivee_idx][col_idx] +
-                           distance_matrix[col_idx][1]),
-                'info_transit': location_info[depart_idx],
-                'info_collecte': location_info[col_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
-    
-    # Site → Transit → Transporteur (fin de tournée après transit)
-    for depart_idx, arrivee_idx in transit_indices:
-        segment = {
-            'type': 'site_transit_fin',
-            'arrets': [1, depart_idx, arrivee_idx, 0],
-            'distance': (distance_matrix[1][depart_idx] +
-                       distance_matrix[depart_idx][arrivee_idx] +
-                       distance_matrix[arrivee_idx][0]),
-            'info_transit': location_info[depart_idx]
-        }
-        segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (2 * TEMPS_OPERATION_HEURES)
-        segments.append(segment)
-    
-    # Site → Livraison → Transit → Collecte → Site
-    for liv_idx in livraison_indices:
-        for depart_idx, arrivee_idx in transit_indices:
-            for col_idx in collecte_indices:
-                segment = {
-                    'type': 'livraison_transit_collecte',
-                    'arrets': [1, liv_idx, depart_idx, arrivee_idx, col_idx, 1],
-                    'distance': (distance_matrix[1][liv_idx] +
-                               distance_matrix[liv_idx][depart_idx] +
-                               distance_matrix[depart_idx][arrivee_idx] +
-                               distance_matrix[arrivee_idx][col_idx] +
-                               distance_matrix[col_idx][1]),
-                    'info_livraison': location_info[liv_idx],
-                    'info_transit': location_info[depart_idx],
-                    'info_collecte': location_info[col_idx]
-                }
-                segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (4 * TEMPS_OPERATION_HEURES)
-                segments.append(segment)
-    
-    # Site → Livraison → Transit → Transporteur (fin directe)
-    for liv_idx in livraison_indices:
-        for depart_idx, arrivee_idx in transit_indices:
-            segment = {
-                'type': 'livraison_transit_fin',
-                'arrets': [1, liv_idx, depart_idx, arrivee_idx, 0],
-                'distance': (distance_matrix[1][liv_idx] +
-                           distance_matrix[liv_idx][depart_idx] +
-                           distance_matrix[depart_idx][arrivee_idx] +
-                           distance_matrix[arrivee_idx][0]),
-                'info_livraison': location_info[liv_idx],
-                'info_transit': location_info[depart_idx]
-            }
-            segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (3 * TEMPS_OPERATION_HEURES)
-            segments.append(segment)
-    
-    # Transit → Transit (enchaînement depuis le site)
-    # Après le 2ème transit le camion est vide → pas de retour au site.
-    # À la place : site → transit1 → transit2 → collecte → site
-    for depart_idx1, arrivee_idx1 in transit_indices:
-        for depart_idx2, arrivee_idx2 in transit_indices:
-            if location_info[depart_idx1]['transit_id'] != location_info[depart_idx2]['transit_id']:
-                # Site → Transit1 → Transit2 → Collecte → Site
-                for col_idx in collecte_indices:
-                    segment = {
-                        'type': 'transit_transit_collecte',
-                        'arrets': [1, depart_idx1, arrivee_idx1, depart_idx2, arrivee_idx2, col_idx, 1],
-                        'distance': (distance_matrix[1][depart_idx1] +
-                                   distance_matrix[depart_idx1][arrivee_idx1] +
-                                   distance_matrix[arrivee_idx1][depart_idx2] +
-                                   distance_matrix[depart_idx2][arrivee_idx2] +
-                                   distance_matrix[arrivee_idx2][col_idx] +
-                                   distance_matrix[col_idx][1]),
-                        'info_transit1': location_info[depart_idx1],
-                        'info_transit2': location_info[depart_idx2],
-                        'info_collecte': location_info[col_idx]
-                    }
-                    segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (5 * TEMPS_OPERATION_HEURES)
-                    segments.append(segment)
-                
-                # Site → Transit1 → Transit2 → Transporteur (fin)
-                segment = {
-                    'type': 'transit_transit_fin',
-                    'arrets': [1, depart_idx1, arrivee_idx1, depart_idx2, arrivee_idx2, 0],
-                    'distance': (distance_matrix[1][depart_idx1] +
-                               distance_matrix[depart_idx1][arrivee_idx1] +
-                               distance_matrix[arrivee_idx1][depart_idx2] +
-                               distance_matrix[depart_idx2][arrivee_idx2] +
-                               distance_matrix[arrivee_idx2][0]),
-                    'info_transit1': location_info[depart_idx1],
-                    'info_transit2': location_info[depart_idx2]
-                }
-                segment['duree_heures'] = (segment['distance'] / 1000 / VITESSE_MOYENNE_KMH) + (4 * TEMPS_OPERATION_HEURES)
-                segments.append(segment)
-    
-    # --- SEGMENTS DE FIN ---
-    
-    # Site → Transporteur
-    segment = {
-        'type': 'fin_depuis_site',
-        'arrets': [1, 0],
-        'distance': distance_matrix[1][0],
-        'info': None
-    }
-    segment['duree_heures'] = segment['distance'] / 1000 / VITESSE_MOYENNE_KMH
-    segments.append(segment)
-    
-    # Livraison → Transporteur
-    for liv_idx in livraison_indices:
-        segment = {
-            'type': 'fin_depuis_livraison',
-            'arrets': [liv_idx, 0],
-            'distance': distance_matrix[liv_idx][0],
-            'info_livraison': location_info[liv_idx]
-        }
-        segment['duree_heures'] = segment['distance'] / 1000 / VITESSE_MOYENNE_KMH
-        segments.append(segment)
-    
-    # Transit → Transporteur
-    for depart_idx, arrivee_idx in transit_indices:
-        segment = {
-            'type': 'fin_depuis_transit',
-            'arrets': [arrivee_idx, 0],
-            'distance': distance_matrix[arrivee_idx][0],
-            'info_transit': location_info[depart_idx]
-        }
-        segment['duree_heures'] = segment['distance'] / 1000 / VITESSE_MOYENNE_KMH
-        segments.append(segment)
-    
-    return segments
+# ==================== CONSTRUCTION DYNAMIQUE DES ATOMES ====================
+#
+# Principe : on ne pre-genere pas les atomes. A chaque etape de la boucle
+# gloutonne, on construit l'atome courant decision par decision :
+#
+#   ETAPE 1 - Debut d'atome (depuis le site) :
+#     a) Choisir une livraison   -> S -> Liv -> [suite]
+#     b) Choisir un transit      -> S -> DebT -> FinT -> [suite]
+#     c) Choisir une collecte    -> S -> Col -> S  (atome complet)
+#
+#   ETAPE 2 - Suite apres livraison ou fin_transit :
+#     a) Terminer au site        -> ... -> S
+#     b) Ajouter une collecte    -> ... -> Col -> S
+#     c) Ajouter un transit      -> ... -> DebT -> FinT -> [suite] (recurse)
+#
+# A chaque decision on evalue le score de chaque option et on choisit
+# la meilleure. L'atome est ferme quand on revient au site.
+#
+# Complexite : O(N_trajets^2) au lieu de O(N_transits!)
 
-# ==================== RECHERCHE DE LA MEILLEURE SOLUTION ====================
+# ==================== CONSTRUCTION ITERATIVE DES ATOMES ====================
+#
+# On abandonne toute recursion. La tournee est construite en etendant
+# l'atome courant noeud par noeud dans une boucle while.
+#
+# Etat courant d'un atome en construction :
+#   - pos       : position actuelle (index dans location_info)
+#   - arrets    : liste des arrets deja visites
+#   - dist      : distance accumulee
+#   - nb_op     : nb d'operations accumulees
+#   - transits_dans_atome : set des transit_id deja utilises dans cet atome
+#   - a_livraison : bool (une livraison a deja ete faite dans cet atome)
+#
+# A chaque iteration on choisit parmi :
+#   1. Fermer l'atome au site (-> S)
+#   2. Ajouter une collecte et fermer (-> Col -> S)
+#   3. Ajouter un transit (-> DebT -> FinT) et continuer
+#   + si atome vide : commencer par une livraison (S -> Liv)
+#     ou un transit  (S -> DebT -> FinT)
+#
+# Critere de choix a chaque etape :
+#   - Priorite 1 : maximiser le nombre de trajets couverts dans l'atome
+#   - Priorite 2 : minimiser la distance
+#
+# Complexite : O(N_trajets * N_transits) par atome, O(N_trajets^2) total.
 
-def find_best_solution_with_dates(segments, collecte_indices, livraison_indices, transit_indices,
-                                  location_info, distance_matrix, duree_max_heures):
-    """
-    Trouve la meilleure date et la meilleure séquence de segments
-    """
-    
-    # Identifier toutes les dates possibles
-    print("\n📅 Identification des dates possibles:")
+def find_best_solution(collecte_indices, livraison_indices, transit_indices,
+                       location_info, distance_matrix, duree_max_heures,
+                       transporteur, params):
+    V  = params['vitesse_moyenne_kmh']
+    OP = params['temps_operation_heures']
+
     dates_possibles = set()
-    
     for idx in collecte_indices + livraison_indices:
-        info = location_info[idx]
-        ajouter_dates(info, dates_possibles)
-    
-    for depart_idx, arrivee_idx in transit_indices:
-        info = location_info[depart_idx]
-        ajouter_dates(info, dates_possibles)
-    
+        ajouter_dates(location_info[idx], dates_possibles)
+    for (dep, arr) in transit_indices:
+        ajouter_dates(location_info[dep], dates_possibles)
+
     if not dates_possibles:
-        return {
-            "error": "Aucune date possible",
-            "details": "Aucune contrainte de date définie"
-        }
-    
-    dates_possibles = sorted(list(dates_possibles))
-    print(f"\n🔍 {len(dates_possibles)} dates candidates à tester")
-    
-    # Tester chaque date
-    print("\n🎯 Test de chaque date:")
-    meilleures_solutions = []
-    
-    for date_candidate in dates_possibles:
-        print(f"\n   📅 Test: {date_candidate.strftime('%d/%m/%Y')}")
-        
-        segments_compatibles = filtrer_segments_par_date(
-            segments, date_candidate, location_info,
-            collecte_indices, livraison_indices, transit_indices
-        )
-        
-        if not segments_compatibles:
-            print(f"      ❌ Aucun segment compatible")
-            continue
-        
-        print(f"      ✅ {len(segments_compatibles)} segments compatibles")
-        
-        solution = construire_meilleure_sequence(
-            segments_compatibles, collecte_indices, livraison_indices, transit_indices,
-            location_info, duree_max_heures, date_candidate
-        )
-        
-        if solution:
-            meilleures_solutions.append(solution)
-    
-    if not meilleures_solutions:
-        return {
-            "error": "Aucune solution trouvée",
-            "details": "Aucune date ne permet de satisfaire les contraintes"
-        }
-    
-    # Choisir la meilleure date
-    solution_optimale = max(
-        meilleures_solutions,
-        key=lambda x: (x['nb_trajets_couverts'], -x['duree_totale'], -x['distance_totale'])
-    )
-    
-    return formater_solution_finale(solution_optimale, location_info,
-                                    collecte_indices, livraison_indices, transit_indices)
+        return {"error": "Aucune date possible",
+                "details": "Aucune contrainte de date definie"}
+
+    dates_possibles = sorted(dates_possibles)
+    print(f"  {len(dates_possibles)} dates candidates")
+
+    meilleures = []
+    for date in dates_possibles:
+        print(f"  Test date: {date.strftime('%d/%m/%Y')}")
+        sol = construire_sequence_gloutonne(
+            collecte_indices, livraison_indices, transit_indices,
+            location_info, distance_matrix, duree_max_heures,
+            date, V, OP)
+        if sol:
+            meilleures.append(sol)
+            print(f"    -> {sol['nb_trajets_couverts']} trajets, "
+                  f"{sol['duree_totale']:.1f}h, "
+                  f"{sol['distance_totale']/1000:.0f}km")
+
+    if not meilleures:
+        return {"error": "Aucune solution trouvee",
+                "details": "Aucune date ne satisfait les contraintes"}
+
+    optimale = max(meilleures,
+                   key=lambda x: (x['nb_trajets_couverts'],
+                                  -x['duree_totale'],
+                                  -x['distance_totale']))
+
+    return formater_solution_finale(
+        optimale, location_info,
+        collecte_indices, livraison_indices, transit_indices)
+
 
 def ajouter_dates(info, dates_possibles):
-    """Ajoute les dates possibles depuis une info de lieu"""
     date_fixe = info.get('date_fixe', '')
-    if date_fixe and date_fixe.strip() != '':
+    if date_fixe and date_fixe.strip():
         try:
-            d = datetime.strptime(date_fixe.strip(), '%Y-%m-%d')
-            dates_possibles.add(d)
-            print(f"   📌 {info['nom']}: Date fixe {d.strftime('%d/%m/%Y')}")
-        except:
-            pass
-    
-    date_debut = info.get('date_flexible_debut', '')
-    date_fin = info.get('date_flexible_fin', '')
-    if date_debut and date_fin and date_debut.strip() != '' and date_fin.strip() != '':
+            dates_possibles.add(datetime.strptime(date_fixe.strip(), '%Y-%m-%d'))
+        except: pass
+    debut = info.get('date_flexible_debut', '')
+    fin   = info.get('date_flexible_fin', '')
+    if debut and fin and debut.strip() and fin.strip():
         try:
-            d_debut = datetime.strptime(date_debut.strip(), '%Y-%m-%d')
-            d_fin = datetime.strptime(date_fin.strip(), '%Y-%m-%d')
-            current = d_debut
-            while current <= d_fin:
-                dates_possibles.add(current)
-                current += timedelta(days=1)
-            print(f"   📅 {info['nom']}: Flexible {d_debut.strftime('%d/%m/%Y')} - {d_fin.strftime('%d/%m/%Y')}")
-        except:
-            pass
+            d = datetime.strptime(debut.strip(), '%Y-%m-%d')
+            f = datetime.strptime(fin.strip(), '%Y-%m-%d')
+            while d <= f:
+                dates_possibles.add(d)
+                d += timedelta(days=1)
+        except: pass
 
-def filtrer_segments_par_date(segments, date_candidate, location_info,
-                              collecte_indices, livraison_indices, transit_indices):
-    """Filtre les segments compatibles avec une date donnée"""
-    segments_compatibles = []
-    
-    for segment in segments:
-        compatible = True
-        
-        for arret_idx in segment['arrets']:
-            if arret_idx in [0, 1]:
-                continue
-            
-            info = location_info[arret_idx]
-            
-            date_fixe = info.get('date_fixe', '')
-            if date_fixe and date_fixe.strip() != '':
-                try:
-                    d = datetime.strptime(date_fixe.strip(), '%Y-%m-%d')
-                    if d != date_candidate:
-                        compatible = False
-                        break
-                except:
-                    pass
-            
-            date_debut = info.get('date_flexible_debut', '')
-            date_fin = info.get('date_flexible_fin', '')
-            if date_debut and date_fin and date_debut.strip() != '' and date_fin.strip() != '':
-                try:
-                    d_debut = datetime.strptime(date_debut.strip(), '%Y-%m-%d')
-                    d_fin = datetime.strptime(date_fin.strip(), '%Y-%m-%d')
-                    if not (d_debut <= date_candidate <= d_fin):
-                        compatible = False
-                        break
-                except:
-                    pass
-        
-        if compatible:
-            segments_compatibles.append(segment)
-    
-    return segments_compatibles
 
-# ==================== CONSTRUCTION DE LA SÉQUENCE ====================
+def date_compatible(info, date_candidate):
+    date_fixe = info.get('date_fixe', '')
+    if date_fixe and date_fixe.strip():
+        try:
+            return datetime.strptime(date_fixe.strip(), '%Y-%m-%d') == date_candidate
+        except: pass
+    debut = info.get('date_flexible_debut', '')
+    fin   = info.get('date_flexible_fin', '')
+    if debut and fin and debut.strip() and fin.strip():
+        try:
+            d = datetime.strptime(debut.strip(), '%Y-%m-%d')
+            f = datetime.strptime(fin.strip(), '%Y-%m-%d')
+            return d <= date_candidate <= f
+        except: pass
+    return True
 
-def construire_meilleure_sequence(segments, collecte_indices, livraison_indices, transit_indices,
-                                  location_info, duree_max_heures, date_candidate):
+
+def construire_sequence_gloutonne(
+        collecte_indices, livraison_indices, transit_indices,
+        location_info, dm, duree_max_heures, date_candidate, V, OP):
     """
-    Construit la meilleure séquence de segments pour une date donnée.
-    
-    Après un transit le camion est vide : les segments qui finissent
-    au transporteur (index 0) sont des fins de tournée valides.
+    Construit la tournee complete pour une date donnee.
+    Boucle : Transporteur(0) -> Site(1) -> [atomes] -> Site(1) -> Transporteur(0)
+    Chaque atome est construit iterativement, sans recursion.
     """
-    
-    collectes_restantes = set(collecte_indices)
+    S = 1
+
     livraisons_restantes = set(livraison_indices)
-    transits_restants = set(range(len(transit_indices)))
-    
-    sequence = []
-    duree_totale = 0
-    distance_totale = 0
-    position_actuelle = 0
-    
-    # 1. DÉBUT
-    segments_debut = [s for s in segments if s['type'] in [
-        'debut_collecte', 'debut_site', 'debut_transit', 'debut_transit_collecte'
-    ]]
-    
-    print(f"\n🔍 DEBUG DÉBUT: {len(segments_debut)} segments de début trouvés")
-    for seg in segments_debut:
-        print(f"   - {seg['type']}: arrets={seg['arrets']}, durée={seg['duree_heures']:.2f}h")
-    
-    # Privilégier les segments utiles (debut_site en dernier)
-    segments_debut_tries = sorted(segments_debut, key=lambda x: (
-        0 if x['type'] == 'debut_site' else -1,
-        x['duree_heures']
-    ))
-    
-    print(f"\n🔍 DEBUG TRI: Ordre après tri:")
-    for i, seg in enumerate(segments_debut_tries):
-        print(f"   {i+1}. {seg['type']}: priorité={0 if seg['type'] == 'debut_site' else -1}, durée={seg['duree_heures']:.2f}h")
-    
-    segment_choisi = None
-    for seg in segments_debut_tries:
-        print(f"\n🔍 DEBUG TEST: {seg['type']} (durée={seg['duree_heures']:.2f}h, max={duree_max_heures})")
-        if duree_max_heures is None or seg['duree_heures'] <= duree_max_heures:
-            valide = True
-            if seg['type'] == 'debut_collecte':
-                if seg['arrets'][1] not in collectes_restantes:
-                    valide = False
-                    print(f"   ❌ Collecte non disponible")
-            elif seg['type'] == 'debut_transit':
-                transit_id = location_info[seg['arrets'][1]]['transit_id']
-                print(f"   → transit_id={transit_id}, transits_restants={transits_restants}")
-                if transit_id not in transits_restants:
-                    valide = False
-                    print(f"   ❌ Transit non disponible")
-            elif seg['type'] == 'debut_transit_collecte':
-                transit_id = location_info[seg['arrets'][1]]['transit_id']
-                if transit_id not in transits_restants or seg['arrets'][3] not in collectes_restantes:
-                    valide = False
-                    print(f"   ❌ Transit ou collecte non disponible")
-            elif seg['type'] == 'debut_site':
-                # debut_site n'est valide que s'il reste des trajets à faire depuis le site
-                if not (collectes_restantes or livraisons_restantes or transits_restants):
-                    valide = False
-                    print(f"   ❌ Aucun trajet restant")
-            
-            print(f"   → valide={valide}")
-            if valide:
-                segment_choisi = seg
-                print(f"   ✅ CHOISI: {seg['type']}")
-                break
-        else:
-            print(f"   ❌ Dépasse durée max")
-    
-    if not segment_choisi:
-        return None
-    
-    sequence.append(segment_choisi)
-    duree_totale += segment_choisi['duree_heures']
-    distance_totale += segment_choisi['distance']
-    
-    # Marquer trajets utilisés du segment de début
-    if segment_choisi['type'] == 'debut_collecte':
-        collectes_restantes.discard(segment_choisi['arrets'][1])
-        position_actuelle = 1
-    elif segment_choisi['type'] == 'debut_site':
-        position_actuelle = 1
-    elif segment_choisi['type'] == 'debut_transit':
-        # NE PAS marquer le transit comme utilisé ici !
-        # Il sera marqué dans la boucle du milieu après qu'on ait quitté l'arrivée
-        position_actuelle = segment_choisi['arrets'][-1]
-    elif segment_choisi['type'] == 'debut_transit_collecte':
-        transit_id = location_info[segment_choisi['arrets'][1]]['transit_id']
-        transits_restants.discard(transit_id)
-        collectes_restantes.discard(segment_choisi['arrets'][3])
-        position_actuelle = 1
-    
-    # 2. MILIEU
-    max_iterations = 20
-    iterations = 0
-    
-    print(f"\n🔍 DEBUG MILIEU: Position après début = {position_actuelle}")
-    print(f"   Reste: {len(collectes_restantes)} collectes, {len(livraisons_restantes)} livraisons, {len(transits_restants)} transits")
-    
-    while (collectes_restantes or livraisons_restantes or transits_restants) and iterations < max_iterations:
-        iterations += 1
-        print(f"\n🔍 DEBUG MILIEU Iteration {iterations}: position={position_actuelle}")
-        segments_possibles = []
-        
-        if position_actuelle == 1:  # Au site
-            print(f"   → Au site (index 1)")
-            for seg in segments:
-                ajouter = False
-                
-                if seg['type'] == 'collecte_simple' and seg['arrets'][1] in collectes_restantes:
-                    ajouter = True
-                elif seg['type'] == 'livraison_simple' and seg['arrets'][1] in livraisons_restantes:
-                    ajouter = True
-                elif seg['type'] == 'livraison_collecte':
-                    if seg['arrets'][1] in livraisons_restantes and seg['arrets'][2] in collectes_restantes:
-                        ajouter = True
-                elif seg['type'] == 'site_transit_collecte':
-                    transit_id = location_info[seg['arrets'][1]]['transit_id']
-                    if transit_id in transits_restants and seg['arrets'][3] in collectes_restantes:
-                        ajouter = True
-                elif seg['type'] == 'site_transit_fin':
-                    transit_id = location_info[seg['arrets'][1]]['transit_id']
-                    if transit_id in transits_restants:
-                        ajouter = True
-                elif seg['type'] == 'livraison_transit_collecte':
-                    transit_id = location_info[seg['arrets'][2]]['transit_id']
-                    if (seg['arrets'][1] in livraisons_restantes and
-                        transit_id in transits_restants and
-                        seg['arrets'][4] in collectes_restantes):
-                        ajouter = True
-                elif seg['type'] == 'livraison_transit_fin':
-                    transit_id = location_info[seg['arrets'][2]]['transit_id']
-                    if seg['arrets'][1] in livraisons_restantes and transit_id in transits_restants:
-                        ajouter = True
-                elif seg['type'] == 'transit_transit_collecte':
-                    tid1 = location_info[seg['arrets'][1]]['transit_id']
-                    tid2 = location_info[seg['arrets'][3]]['transit_id']
-                    if tid1 in transits_restants and tid2 in transits_restants and seg['arrets'][5] in collectes_restantes:
-                        ajouter = True
-                elif seg['type'] == 'transit_transit_fin':
-                    tid1 = location_info[seg['arrets'][1]]['transit_id']
-                    tid2 = location_info[seg['arrets'][3]]['transit_id']
-                    if tid1 in transits_restants and tid2 in transits_restants:
-                        ajouter = True
-                
-                if ajouter:
-                    segments_possibles.append(seg)
-        
-        else:  # Position autre que site (ex: arrivée d'un transit)
-            # Chercher des segments qui partent de cette position
-            # Typiquement : segments de collecte ou retour au site/transporteur
-            print(f"   → Autre position (index {position_actuelle}, pas au site)")
-            print(f"   → Cherche segments commençant par index {position_actuelle}")
-            segments_testés = 0
-            for seg in segments:
-                # Le segment doit commencer par notre position actuelle
-                if len(seg['arrets']) > 0 and seg['arrets'][0] == position_actuelle:
-                    segments_testés += 1
-                    print(f"      Segment trouvé: {seg['type']}, arrets={seg['arrets']}")
-                    ajouter = False
-                    
-                    # Vérifier que les trajets du segment sont encore disponibles
-                    if seg['type'] == 'fin_depuis_transit':
-                        ajouter = True
-                        print(f"         → fin_depuis_transit → ajouter=True")
-                    elif 'collecte' in seg['type']:
-                        # Vérifier si les collectes sont disponibles
-                        collectes_seg = [a for a in seg['arrets'] if a in collectes_restantes]
-                        if collectes_seg:
-                            ajouter = True
-                        print(f"         → collecte segment, collectes dispo={collectes_seg} → ajouter={ajouter}")
-                    
-                    if ajouter:
-                        segments_possibles.append(seg)
-            
-            print(f"   → {segments_testés} segments testés commençant par {position_actuelle}")
-        
-        print(f"   → {len(segments_possibles)} segments possibles trouvés")
-        
-        # Filtrer par durée
-        segments_possibles = [
-            s for s in segments_possibles
-            if duree_max_heures is None or (duree_totale + s['duree_heures']) <= duree_max_heures
-        ]
-        
-        print(f"   → {len(segments_possibles)} segments après filtrage durée")
-        
-        if not segments_possibles:
-            print(f"   ❌ Aucun segment possible, sortie de la boucle")
+    collectes_restantes  = set(collecte_indices)
+    transits_restants    = set(range(len(transit_indices)))
+
+    d_aller  = dm[0][S]
+    d_retour = dm[S][0]
+    overhead_aller_retour = (d_aller + d_retour) / 1000.0 / V
+
+    sequence_atomes = []
+    duree_atomes    = 0.0
+    distance_atomes = 0.0
+
+    MAX_ATOMES = 500
+    for _ in range(MAX_ATOMES):
+        if not livraisons_restantes and not collectes_restantes and not transits_restants:
             break
-        
-        # Trier : privilégier les segments avec le plus de trajets, puis par distance.
-        # Les segments finissant au transporteur (index 0) sont déprioritisés
-        # sauf s'il n'y a plus d'autres trajets à faire après.
-        reste_a_faire = len(collectes_restantes) + len(livraisons_restantes) + len(transits_restants)
-        segments_possibles.sort(key=lambda x: (
-            # Si plus d'un trajet à faire, on préfère ne pas finir au transporteur
-            1 if (x['arrets'][-1] == 0 and reste_a_faire > self_count_trajets(x, location_info)) else 0,
-            -len([a for a in x['arrets'] if a not in [0, 1]]),
-            x['distance']
-        ))
-        
-        seg = segments_possibles[0]
-        sequence.append(seg)
-        duree_totale += seg['duree_heures']
-        distance_totale += seg['distance']
-        
-        # Marquer trajets utilisés
-        for arret_idx in seg['arrets']:
-            if arret_idx in collectes_restantes:
-                collectes_restantes.discard(arret_idx)
-            if arret_idx in livraisons_restantes:
-                livraisons_restantes.discard(arret_idx)
-            info = location_info[arret_idx]
-            if info['type'] == 'transit_depart':
-                transits_restants.discard(info['transit_id'])
-        
-        # Si on quitte une position qui est une arrivée de transit, marquer ce transit comme utilisé
-        if position_actuelle not in [0, 1]:  # Pas transporteur ni site
-            info_position = location_info[position_actuelle]
-            if info_position['type'] == 'transit_arrivee':
-                transits_restants.discard(info_position['transit_id'])
-                print(f"   → Quitte arrivée transit {info_position['transit_id']}, marqué comme utilisé")
-        
-        position_actuelle = seg['arrets'][-1]
-        
-        # Si le segment se termine au transporteur, fin de tournée
-        if position_actuelle == 0:
+
+        budget_restant = (duree_max_heures - overhead_aller_retour - duree_atomes
+                          if duree_max_heures is not None else None)
+
+        atome = _construire_un_atome(
+            S,
+            livraisons_restantes, collectes_restantes, transits_restants,
+            transit_indices, location_info, dm, V, OP,
+            budget_restant, date_candidate)
+
+        if atome is None:
             break
-    
-    # 3. FIN
-    # Si on est déjà au transporteur (segment _fin), pas besoin d'ajouter un segment de fin
-    if position_actuelle == 0:
-        nb_trajets_couverts = (
-            len(collecte_indices) - len(collectes_restantes) +
-            len(livraison_indices) - len(livraisons_restantes) +
-            len(transit_indices) - len(transits_restants)
-        )
-        
-        print(f"      📊 {len(sequence)} segments, {nb_trajets_couverts} trajets, {duree_totale:.1f}h, {distance_totale/1000:.1f}km")
-        
-        return {
-            'date': date_candidate,
-            'sequence': sequence,
-            'nb_trajets_couverts': nb_trajets_couverts,
-            'duree_totale': duree_totale,
-            'distance_totale': distance_totale,
-            'collectes_restantes': collectes_restantes,
-            'livraisons_restantes': livraisons_restantes,
-            'transits_restants': transits_restants,
-            'duree_max_heures': duree_max_heures
-        }
-    
-    # Sinon on cherche un segment de fin depuis la position actuelle
-    segments_fin = [s for s in segments if s['type'] in [
-        'fin_depuis_site', 'fin_depuis_livraison', 'fin_depuis_transit'
-    ]]
-    
-    segment_fin = None
-    
-    if position_actuelle == 1:
-        for seg in segments_fin:
-            if seg['type'] == 'fin_depuis_site':
-                if duree_max_heures is None or (duree_totale + seg['duree_heures']) <= duree_max_heures:
-                    segment_fin = seg
-                    break
-    else:
-        for seg in segments_fin:
-            if seg['arrets'][0] == position_actuelle:
-                if duree_max_heures is None or (duree_totale + seg['duree_heures']) <= duree_max_heures:
-                    segment_fin = seg
-                    break
-    
-    if segment_fin:
-        sequence.append(segment_fin)
-        duree_totale += segment_fin['duree_heures']
-        distance_totale += segment_fin['distance']
-    else:
+
+        sequence_atomes.append(atome)
+        duree_atomes    += atome['duree_heures']
+        distance_atomes += atome['distance']
+
+        for l in atome['livraisons']:  livraisons_restantes.discard(l)
+        for c in atome['collectes']:   collectes_restantes.discard(c)
+        for t in atome['transits']:    transits_restants.discard(t)
+
+    if not sequence_atomes:
         return None
-    
-    nb_trajets_couverts = (
-        len(collecte_indices) - len(collectes_restantes) +
-        len(livraison_indices) - len(livraisons_restantes) +
-        len(transit_indices) - len(transits_restants)
-    )
-    
-    print(f"      📊 {len(sequence)} segments, {nb_trajets_couverts} trajets, {duree_totale:.1f}h, {distance_totale/1000:.1f}km")
-    
+
+    nb_trajets = (len(collecte_indices)  - len(collectes_restantes) +
+                  len(livraison_indices) - len(livraisons_restantes) +
+                  len(transit_indices)   - len(transits_restants))
+
     return {
         'date': date_candidate,
-        'sequence': sequence,
-        'nb_trajets_couverts': nb_trajets_couverts,
-        'duree_totale': duree_totale,
-        'distance_totale': distance_totale,
+        'sequence_atomes': sequence_atomes,
+        'nb_trajets_couverts': nb_trajets,
+        'duree_totale': duree_atomes + overhead_aller_retour,
+        'distance_totale': distance_atomes + d_aller + d_retour,
         'collectes_restantes': collectes_restantes,
         'livraisons_restantes': livraisons_restantes,
         'transits_restants': transits_restants,
         'duree_max_heures': duree_max_heures
     }
 
-def self_count_trajets(segment, location_info):
-    """Compte le nombre de trajets utiles dans un segment (hors transporteur et site)"""
-    count = 0
-    for arret_idx in segment['arrets']:
-        if arret_idx not in [0, 1]:
-            info = location_info[arret_idx]
-            # On compte une fois par trajet : collecte, livraison, transit_depart
-            if info['type'] in ['collecte', 'livraison', 'transit_depart']:
-                count += 1
-    return count
 
-# ==================== FORMATAGE DE LA SOLUTION ====================
+def _construire_un_atome(S, livraisons_restantes, collectes_restantes,
+                          transits_restants, transit_indices,
+                          location_info, dm, V, OP, budget_restant, date_candidate):
+    """
+    Construit UN atome complet Site->...->Site de facon iterative.
 
-def formater_solution_finale(solution, location_info, collecte_indices, livraison_indices, transit_indices):
+    Regles metier respectees :
+      - Livraison  : site → livraison → (collecte | debut_transit | site)
+      - Collecte   : (site | fin_transit | livraison) → collecte → site
+      - Transit    : (site | livraison) → debut_transit → fin_transit
+                     → (site | collecte | debut_transit)
+
+    L'atome stocke toujours ses arrets avec S en tete et S en queue :
+      arrets = [S, noeud1, noeud2, ..., S]
     """
-    Formate la solution finale avec les IDs
-    """
-    date_optimale = solution['date']
-    sequence = solution['sequence']
-    date_str = date_optimale.strftime('%Y-%m-%d')
-    
-    itineraire_brut = []
-    phase = 1
-    
-    for seg_num, segment in enumerate(sequence):
-        for i, arret_idx in enumerate(segment['arrets']):
-            info = location_info[arret_idx]
-            
-            # Déterminer le type d'arrêt
-            if info['type'] == 'transporteur':
-                type_arret = 'depart_transporteur' if (seg_num == 0 and i == 0) else 'retour_transporteur'
-            elif info['type'] == 'site':
-                est_arrivee = False
-                est_depart = False
-                
-                if i > 0:
-                    info_precedent = location_info[segment['arrets'][i-1]]
-                    if info_precedent['type'] in ['collecte', 'transit_arrivee']:
-                        est_arrivee = True
-                
-                if i < len(segment['arrets']) - 1:
-                    info_suivant = location_info[segment['arrets'][i+1]]
-                    if info_suivant['type'] in ['livraison', 'collecte', 'transit_depart']:
-                        est_depart = True
-                
-                if est_arrivee and est_depart:
-                    type_arret = 'passage_site'
-                elif est_depart:
-                    type_arret = 'depart_site'
-                elif est_arrivee:
-                    type_arret = 'arrivee_site'
-                else:
-                    type_arret = 'passage_site'
-            elif info['type'] == 'collecte':
-                type_arret = 'collecte'
-            elif info['type'] == 'livraison':
-                type_arret = 'livraison'
-            elif info['type'] == 'transit_depart':
-                type_arret = 'transit_chargement'
-            elif info['type'] == 'transit_arrivee':
-                type_arret = 'transit_livraison'
-            else:
-                type_arret = info['type']
-            
-            # Construire l'arrêt avec les IDs
-            arret = {
-                'phase': phase,
-                'type': type_arret,
-                'client': info['nom'],
-                'adresse': info['adresse'],
-                'date_prevue': date_str,
-                'idx': arret_idx
-            }
-            
-            # Ajouter les IDs selon le type
-            if info['type'] == 'transporteur':
-                arret['ID_transporteur'] = info.get('ID_transporteur', '')
-            elif info['type'] == 'collecte':
-                arret['ID_entree'] = info.get('ID_entree', '')
-            elif info['type'] == 'livraison':
-                arret['ID_sortie'] = info.get('ID_sortie', '')
-            elif info['type'] in ['transit_depart', 'transit_arrivee']:
-                arret['ID_transit'] = info.get('ID_transit', '')
-                arret['matiere'] = info.get('matiere', '')
-            
-            itineraire_brut.append(arret)
-        
-        phase += 1
-    
-    # Dédupliquer les passages au site consécutifs
+    pos                 = S
+    arrets              = [S]       # inclut le S initial
+    dist                = 0.0
+    nb_op               = 0
+    transits_dans_atome = set()
+    a_livraison         = False
+    livraisons_atome    = []
+    collectes_atome     = []
+    transits_atome      = []
+
+    # Type du dernier noeud utile (pour valider les transitions)
+    # 'site' | 'livraison' | 'fin_transit'
+    type_pos = 'site'
+
+    MAX_NOEUDS = 200
+    for _ in range(MAX_NOEUDS):
+
+        # ================================================================
+        # Options de fermeture (toujours evaluees)
+        # ================================================================
+        meilleures_fermetures = []
+
+        # La fermeture directe au site est possible depuis :
+        #   site (atome vide -> invalide), livraison, fin_transit
+        # Un atome vide (arrets == [S]) n'est pas valide.
+        if len(arrets) > 1:
+
+            # Fermer au site directement
+            d_fermer = dm[pos][S]
+            duree_fermer = (dist + d_fermer) / 1000.0 / V + nb_op * OP
+            if budget_restant is None or duree_fermer <= budget_restant:
+                nb = len(livraisons_atome) + len(collectes_atome) + len(transits_atome)
+                meilleures_fermetures.append({
+                    'score': (-nb, dist + d_fermer),
+                    'type': 'fermer',
+                    'dist_finale': dist + d_fermer,
+                    'duree_finale': duree_fermer,
+                    'arrets_finaux': arrets + [S],
+                })
+
+            # Fermer via une collecte -> site
+            # Autorise depuis : livraison, fin_transit, (et site si atome non vide)
+            if type_pos in ('livraison', 'fin_transit', 'site') and len(arrets) > 1:
+                for col in collectes_restantes:
+                    if col in collectes_atome:
+                        continue
+                    if not date_compatible(location_info[col], date_candidate):
+                        continue
+                    d_col = dm[pos][col] + dm[col][S]
+                    duree_col = (dist + d_col) / 1000.0 / V + (nb_op + 1) * OP
+                    if budget_restant is None or duree_col <= budget_restant:
+                        nb = (len(livraisons_atome) + len(collectes_atome) + 1 +
+                              len(transits_atome))
+                        meilleures_fermetures.append({
+                            'score': (-nb, dist + d_col),
+                            'type': 'fermer_col',
+                            'col': col,
+                            'dist_finale': dist + d_col,
+                            'duree_finale': duree_col,
+                            'arrets_finaux': arrets + [col, S],
+                        })
+
+        # ================================================================
+        # Options d'extension (selon les regles metier)
+        # ================================================================
+        extensions = []
+
+        # -- Livraison : uniquement depuis site, en debut d'atome --
+        # site → livraison
+        if type_pos == 'site' and len(arrets) == 1 and not a_livraison:
+            for liv in livraisons_restantes:
+                if not date_compatible(location_info[liv], date_candidate):
+                    continue
+                d_liv = dm[S][liv]
+                duree_min = (d_liv + dm[liv][S]) / 1000.0 / V + OP
+                if budget_restant is None or duree_min <= budget_restant:
+                    extensions.append({
+                        'type': 'livraison',
+                        'idx': liv,
+                        'gain': 1,
+                        'dist_ajout': d_liv,
+                    })
+
+        # -- Transit : depuis site ou livraison --
+        # site → debut_transit  OU  livraison → debut_transit
+        # OU  fin_transit → debut_transit  (enchaînement)
+        if type_pos in ('site', 'livraison', 'fin_transit'):
+            for tid in transits_restants:
+                if tid in transits_dans_atome:
+                    continue
+                dep_idx, arr_idx = transit_indices[tid]
+                if not date_compatible(location_info[dep_idx], date_candidate):
+                    continue
+                d_tr = dm[pos][dep_idx] + dm[dep_idx][arr_idx]
+                duree_min = (dist + d_tr + dm[arr_idx][S]) / 1000.0 / V + (nb_op + 2) * OP
+                if budget_restant is None or duree_min <= budget_restant:
+                    extensions.append({
+                        'type': 'transit',
+                        'tid': tid,
+                        'dep': dep_idx,
+                        'arr': arr_idx,
+                        'gain': 1,
+                        'dist_ajout': d_tr,
+                    })
+
+        # ================================================================
+        # Decision
+        # ================================================================
+        if not extensions:
+            # Plus rien a etendre : fermer si possible
+            if meilleures_fermetures:
+                meilleures_fermetures.sort(key=lambda x: x['score'])
+                f = meilleures_fermetures[0]
+                return _finaliser_atome(f, livraisons_atome, collectes_atome,
+                                        transits_atome, f['dist_finale'], f['duree_finale'])
+            return None
+
+        meilleure_fermeture = None
+        if meilleures_fermetures:
+            meilleures_fermetures.sort(key=lambda x: x['score'])
+            meilleure_fermeture = meilleures_fermetures[0]
+
+        nb_actuel = len(livraisons_atome) + len(collectes_atome) + len(transits_atome)
+        extensions.sort(key=lambda x: (-x['gain'], x['dist_ajout']))
+        meilleure_ext = extensions[0]
+
+        nb_si_extension = nb_actuel + meilleure_ext['gain']
+        nb_si_fermeture = -meilleure_fermeture['score'][0] if meilleure_fermeture else 0
+
+        # Etendre si l'extension couvre plus de trajets, ou si l'atome est encore vide
+        if nb_si_extension <= nb_si_fermeture and nb_actuel > 0:
+            f = meilleure_fermeture
+            return _finaliser_atome(f, livraisons_atome, collectes_atome,
+                                    transits_atome, f['dist_finale'], f['duree_finale'])
+
+        # Appliquer l'extension
+        ext = meilleure_ext
+        if ext['type'] == 'livraison':
+            liv = ext['idx']
+            dist += dm[S][liv]
+            nb_op += 1
+            arrets.append(liv)
+            livraisons_atome.append(liv)
+            a_livraison = True
+            pos = liv
+            type_pos = 'livraison'
+
+        elif ext['type'] == 'transit':
+            tid = ext['tid']
+            dep = ext['dep']
+            arr = ext['arr']
+            dist += dm[pos][dep] + dm[dep][arr]
+            nb_op += 2
+            arrets += [dep, arr]
+            transits_dans_atome.add(tid)
+            transits_atome.append(tid)
+            pos = arr
+            type_pos = 'fin_transit'
+
+    # Garde-fou : fermer si possible
+    if len(arrets) > 1 and meilleures_fermetures:
+        meilleures_fermetures.sort(key=lambda x: x['score'])
+        f = meilleures_fermetures[0]
+        return _finaliser_atome(f, livraisons_atome, collectes_atome,
+                                transits_atome, f['dist_finale'], f['duree_finale'])
+    return None
+
+
+def _finaliser_atome(fermeture, livraisons_atome, collectes_atome, transits_atome,
+                     dist_finale, duree_finale):
+    """Construit le dict atome final depuis une option de fermeture."""
+    if fermeture['type'] == 'fermer_col':
+        col = fermeture['col']
+        collectes_finales = collectes_atome + [col]
+    else:
+        collectes_finales = list(collectes_atome)
+
+    nb = len(livraisons_atome) + len(collectes_finales) + len(transits_atome)
+    return {
+        'arrets': fermeture['arrets_finaux'],
+        'distance': dist_finale,
+        'duree_heures': duree_finale,
+        'nb_trajets': nb,
+        'livraisons': list(livraisons_atome),
+        'collectes': collectes_finales,
+        'transits': list(transits_atome),
+    }
+
+# ==================== FORMATAGE ====================
+
+def formater_solution_finale(solution, location_info,
+                              collecte_indices, livraison_indices, transit_indices):
+    date_str = solution['date'].strftime('%Y-%m-%d')
+    date_fmt = solution['date'].strftime('%d/%m/%Y')
+    info_tr   = location_info[0]
+    info_site = location_info[1]
     itineraire = []
     ordre = 1
-    i = 0
-    
-    while i < len(itineraire_brut):
-        arret_actuel = itineraire_brut[i]
-        
-        if arret_actuel['type'] in ['arrivee_site', 'depart_site', 'passage_site']:
-            if i + 1 < len(itineraire_brut):
-                arret_suivant = itineraire_brut[i + 1]
-                if arret_suivant['type'] in ['arrivee_site', 'depart_site', 'passage_site']:
-                    itineraire.append({
-                        'ordre': ordre,
-                        'phase': arret_actuel['phase'],
-                        'type': 'passage_site',
-                        'client': arret_actuel['client'],
-                        'adresse': arret_actuel['adresse'],
-                        'date_prevue': arret_actuel['date_prevue']
-                    })
-                    ordre += 1
-                    i += 2
-                    continue
-        
-        arret_final = arret_actuel.copy()
-        arret_final['ordre'] = ordre
-        del arret_final['idx']
-        itineraire.append(arret_final)
-        ordre += 1
-        i += 1
-    
-    # Trajets non inclus
-    collectes_restantes = solution['collectes_restantes']
-    livraisons_restantes = solution['livraisons_restantes']
-    transits_restants = solution['transits_restants']
-    
+
+    itineraire.append({
+        'ordre': ordre, 'phase': 0, 'type': 'depart_transporteur',
+        'client': info_tr['nom'], 'adresse': info_tr['adresse'],
+        'ID_transporteur': info_tr.get('ID_transporteur', ''),
+        'date_prevue': date_str
+    }); ordre += 1
+
+    nb_atomes = len(solution['sequence_atomes'])
+    for phase_num, atome in enumerate(solution['sequence_atomes'], start=1):
+        # Afficher le site en debut d'atome (= arrets[0] = S)
+        # Pour le 1er atome c'est l'arrivee sur site depuis le transporteur,
+        # pour les suivants c'est un passage site (deja affiche en fin du precedent).
+        if phase_num == 1:
+            itineraire.append({
+                'ordre': ordre, 'phase': phase_num, 'type': 'arrivee_site',
+                'client': info_site['nom'], 'adresse': info_site['adresse'],
+                'date_prevue': date_str
+            }); ordre += 1
+
+        # Arrêts internes (tout sauf S initial et S final)
+        for idx in atome['arrets'][1:-1]:
+            info = location_info[idx]
+            t    = info['type']
+            if t == 'livraison':
+                arret = {'ordre': ordre, 'phase': phase_num, 'type': 'livraison',
+                         'client': info['nom'], 'adresse': info['adresse'],
+                         'ID_sortie': info.get('ID_sortie', ''), 'date_prevue': date_str}
+            elif t == 'collecte':
+                arret = {'ordre': ordre, 'phase': phase_num, 'type': 'collecte',
+                         'client': info['nom'], 'adresse': info['adresse'],
+                         'ID_entree': info.get('ID_entree', ''), 'date_prevue': date_str}
+            elif t == 'transit_depart':
+                arret = {'ordre': ordre, 'phase': phase_num, 'type': 'transit_chargement',
+                         'client': info['nom'], 'adresse': info['adresse'],
+                         'ID_transit': info.get('ID_transit', ''),
+                         'matiere': info.get('matiere', ''), 'date_prevue': date_str}
+            elif t == 'transit_arrivee':
+                arret = {'ordre': ordre, 'phase': phase_num, 'type': 'transit_livraison',
+                         'client': info['nom'], 'adresse': info['adresse'],
+                         'ID_transit': info.get('ID_transit', ''),
+                         'matiere': info.get('matiere', ''), 'date_prevue': date_str}
+            else:
+                arret = {'ordre': ordre, 'phase': phase_num, 'type': t,
+                         'client': info['nom'], 'adresse': info['adresse'],
+                         'date_prevue': date_str}
+            itineraire.append(arret); ordre += 1
+
+        # Passage site apres cet atome, sauf apres le dernier
+        # (le dernier atome se termine au site, d'ou repart le transporteur)
+        if phase_num < nb_atomes:
+            itineraire.append({
+                'ordre': ordre, 'phase': phase_num, 'type': 'passage_site',
+                'client': info_site['nom'], 'adresse': info_site['adresse'],
+                'date_prevue': date_str
+            }); ordre += 1
+
+    itineraire.append({
+        'ordre': ordre, 'phase': nb_atomes + 1,
+        'type': 'retour_transporteur',
+        'client': info_tr['nom'], 'adresse': info_tr['adresse'],
+        'ID_transporteur': info_tr.get('ID_transporteur', ''),
+        'date_prevue': date_str
+    })
+
     trajets_non_inclus = []
-    for idx in collectes_restantes:
-        trajets_non_inclus.append({
-            'type': 'collecte',
+    for idx in solution['collectes_restantes']:
+        trajets_non_inclus.append({'type': 'collecte',
             'ID_entree': location_info[idx].get('ID_entree', ''),
             'client': location_info[idx]['nom'],
-            'raison': 'Contrainte de durée maximale dépassée ou date incompatible'
-        })
-    for idx in livraisons_restantes:
-        trajets_non_inclus.append({
-            'type': 'livraison',
+            'raison': 'Contrainte de duree ou date incompatible'})
+    for idx in solution['livraisons_restantes']:
+        trajets_non_inclus.append({'type': 'livraison',
             'ID_sortie': location_info[idx].get('ID_sortie', ''),
             'client': location_info[idx]['nom'],
-            'raison': 'Contrainte de durée maximale dépassée ou date incompatible'
-        })
-    for transit_id in transits_restants:
-        depart_idx, _ = transit_indices[transit_id]
-        trajets_non_inclus.append({
-            'type': 'transit',
-            'ID_transit': location_info[depart_idx].get('ID_transit', ''),
-            'client': location_info[depart_idx]['nom'],
-            'matiere': location_info[depart_idx].get('matiere', ''),
-            'raison': 'Contrainte de durée maximale dépassée ou date incompatible'
-        })
-    
-    nb_total_trajets = len(collecte_indices) + len(livraison_indices) + len(transit_indices)
-    nb_trajets_inclus = solution['nb_trajets_couverts']
-    
+            'raison': 'Contrainte de duree ou date incompatible'})
+    for tid in solution['transits_restants']:
+        dep_idx, _ = transit_indices[tid]
+        trajets_non_inclus.append({'type': 'transit',
+            'ID_transit': location_info[dep_idx].get('ID_transit', ''),
+            'matiere': location_info[dep_idx].get('matiere', ''),
+            'raison': 'Contrainte de duree ou date incompatible'})
+
+    nb_total  = len(collecte_indices) + len(livraison_indices) + len(transit_indices)
+    nb_inclus = solution['nb_trajets_couverts']
+
     result = {
         'success': True,
         'solution_complete': len(trajets_non_inclus) == 0,
         'date_optimale': date_str,
-        'date_optimale_formatee': date_optimale.strftime('%d/%m/%Y'),
+        'date_optimale_formatee': date_fmt,
         'itineraire': itineraire,
-        'nombre_segments': len(sequence),
+        'nombre_atomes': len(solution['sequence_atomes']),
         'statistiques': {
             'distance_totale_km': round(solution['distance_totale'] / 1000, 2),
             'duree_totale_heures': round(solution['duree_totale'], 2),
             'duree_max_autorisee_heures': solution.get('duree_max_heures'),
             'cout_estime_euros': round(solution['distance_totale'] / 1000 * 1.5, 2),
-            'nombre_collectes_incluses': len(collecte_indices) - len(collectes_restantes),
+            'nombre_collectes_incluses': len(collecte_indices) - len(solution['collectes_restantes']),
             'nombre_collectes_totales': len(collecte_indices),
-            'nombre_livraisons_incluses': len(livraison_indices) - len(livraisons_restantes),
+            'nombre_livraisons_incluses': len(livraison_indices) - len(solution['livraisons_restantes']),
             'nombre_livraisons_totales': len(livraison_indices),
-            'nombre_transits_inclus': len(transit_indices) - len(transits_restants),
+            'nombre_transits_inclus': len(transit_indices) - len(solution['transits_restants']),
             'nombre_transits_totaux': len(transit_indices),
-            'taux_completion': f"{(nb_trajets_inclus / nb_total_trajets * 100):.0f}%" if nb_total_trajets > 0 else "0%"
+            'taux_completion': f"{nb_inclus/nb_total*100:.0f}%" if nb_total > 0 else "0%"
         },
         'explication': {
-            'methode': 'Optimisation avec transporteurs, segments intelligents et transits',
-            'date_choisie_raison': f"Permet de couvrir {nb_trajets_inclus}/{nb_total_trajets} trajets"
+            'methode': 'Glouton iteratif sans recursion - O(N^2)',
+            'date_choisie_raison': f"Couvre {nb_inclus}/{nb_total} trajets"
         }
     }
-    
     if trajets_non_inclus:
         result['trajets_non_inclus'] = trajets_non_inclus
         result['avertissement'] = f"{len(trajets_non_inclus)} trajet(s) non inclus"
-    
     return result
 
-# ==================== CALCUL DES DISTANCES ====================
+# ==================== DISTANCES ====================
+
+def load_distances_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+                print(f"   Cache charge ({len(cache)} entrees)")
+                return cache
+    except Exception as e:
+        print(f"   Erreur cache: {e}")
+    return {}
+
+def save_distances_cache(cache):
+    try:
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        print(f"   Erreur sauvegarde cache: {e}")
+
+def get_cache_key(origin, destination):
+    try:
+        return f"{str(origin).strip().lower()}|{str(destination).strip().lower()}"
+    except:
+        return None
 
 def get_distance_matrix(locations):
-    """
-    Calcule la matrice de distances entre tous les lieux
-    """
     n = len(locations)
-    distance_matrix = [[0 for _ in range(n)] for _ in range(n)]
-    
-    if gmaps is None:
-        print("⚠️  Google Maps non configuré, utilisation de distances estimées")
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    distance_matrix[i][j] = (abs(i-j) * 50000) + 20000
-        return distance_matrix
-    
-    try:
-        for i in range(n):
-            result = gmaps.distance_matrix(
-                origins=[locations[i]],
-                destinations=locations,
-                mode='driving',
-                units='metric'
-            )
-            
-            for j in range(n):
-                if i != j:
-                    try:
-                        distance = result['rows'][0]['elements'][j]['distance']['value']
-                        distance_matrix[i][j] = distance
-                        print(f"   Distance {i}→{j}: {distance/1000:.1f} km")
-                    except:
-                        distance_matrix[i][j] = 999999
-                        print(f"   ⚠️ Pas de route entre {i} et {j}")
-        
-        return distance_matrix
-    
-    except Exception as e:
-        print(f"❌ Erreur Google Maps: {e}")
-        print("⚠️  Utilisation de distances estimées")
-        for i in range(n):
-            for j in range(n):
-                if i != j:
-                    distance_matrix[i][j] = (abs(i-j) * 50000) + 20000
+    distance_matrix = [[0.0] * n for _ in range(n)]
+
+    if n <= 1:
         return distance_matrix
 
-# ==================== DÉMARRAGE ====================
+    if gmaps is None:
+        return _estimate_distance_matrix(locations)
+
+    cache = load_distances_cache()
+
+    if n <= 25:
+        return _get_distance_matrix_simple(locations, distance_matrix, cache)
+    return _get_distance_matrix_chunked(locations, distance_matrix, cache)
+
+def _get_distance_matrix_simple(locations, distance_matrix, cache):
+    n = len(locations)
+
+    all_cached = True
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                distance_matrix[i][j] = 0.0
+                continue
+            key = get_cache_key(locations[i], locations[j])
+            if key and key in cache:
+                try:
+                    distance_matrix[i][j] = float(cache[key]['distance_m'])
+                except:
+                    all_cached = False
+            else:
+                all_cached = False
+
+    if all_cached:
+        return distance_matrix
+
+    try:
+        result = gmaps.distance_matrix(
+            origins=locations, destinations=locations,
+            mode='driving', units='metric')
+
+        if result['status'] != 'OK':
+            return _estimate_distance_matrix(locations)
+
+        for i in range(n):
+            for j in range(n):
+                try:
+                    el = result['rows'][i]['elements'][j]
+                    if el['status'] == 'OK':
+                        d = float(el['distance']['value'])
+                        distance_matrix[i][j] = max(0.0, d)
+                        key = get_cache_key(locations[i], locations[j])
+                        if key:
+                            cache[key] = {
+                                'distance_m': d,
+                                'duration_s': float(el['duration']['value']),
+                                'cached_at': datetime.now().isoformat()
+                            }
+                    else:
+                        distance_matrix[i][j] = 100000.0
+                except:
+                    distance_matrix[i][j] = 100000.0
+
+        save_distances_cache(cache)
+        return distance_matrix
+
+    except Exception as e:
+        print(f"Erreur Google Maps: {e}")
+        return _estimate_distance_matrix(locations)
+
+def _get_distance_matrix_chunked(locations, distance_matrix, cache):
+    n = len(locations)
+    chunks = [(i, min(i + CHUNK_SIZE, n)) for i in range(0, n, CHUNK_SIZE)]
+
+    for orig_s, orig_e in chunks:
+        for dest_s, dest_e in chunks:
+            ch_orig = locations[orig_s:orig_e]
+            ch_dest = locations[dest_s:dest_e]
+
+            missing = []
+            for i_rel, i_abs in enumerate(range(orig_s, orig_e)):
+                for j_rel, j_abs in enumerate(range(dest_s, dest_e)):
+                    key = get_cache_key(locations[i_abs], locations[j_abs])
+                    if key and key in cache:
+                        try:
+                            distance_matrix[i_abs][j_abs] = float(cache[key]['distance_m'])
+                        except:
+                            missing.append((i_rel, j_rel, i_abs, j_abs))
+                    else:
+                        missing.append((i_rel, j_rel, i_abs, j_abs))
+
+            if not missing:
+                continue
+
+            try:
+                result = gmaps.distance_matrix(
+                    origins=ch_orig, destinations=ch_dest,
+                    mode='driving', units='metric')
+
+                if result['status'] != 'OK':
+                    continue
+
+                for i_rel in range(len(ch_orig)):
+                    for j_rel in range(len(ch_dest)):
+                        i_abs = orig_s + i_rel
+                        j_abs = dest_s + j_rel
+                        try:
+                            el = result['rows'][i_rel]['elements'][j_rel]
+                            if el['status'] == 'OK':
+                                d = float(el['distance']['value'])
+                                distance_matrix[i_abs][j_abs] = max(0.0, d)
+                                key = get_cache_key(locations[i_abs], locations[j_abs])
+                                if key:
+                                    cache[key] = {
+                                        'distance_m': d,
+                                        'duration_s': float(el['duration']['value']),
+                                        'cached_at': datetime.now().isoformat()
+                                    }
+                            else:
+                                distance_matrix[i_abs][j_abs] = 100000.0
+                        except:
+                            distance_matrix[i_abs][j_abs] = 100000.0
+
+                save_distances_cache(cache)
+                time.sleep(0.1)
+
+            except Exception as e:
+                print(f"Erreur chunk API: {e}")
+
+    # Completer les cases manquantes
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                distance_matrix[i][j] = 0.0
+            elif distance_matrix[i][j] == 0.0:
+                distance_matrix[i][j] = _estimate_single_distance(
+                    locations[i], locations[j])
+
+    return distance_matrix
+
+def _estimate_single_distance(origin, destination):
+    try:
+        op = str(origin).split(',')
+        dp = str(destination).split(',')
+        if len(op) >= 2 and len(dp) >= 2:
+            lat1, lon1 = float(op[0].strip()), float(op[1].strip())
+            lat2, lon2 = float(dp[0].strip()), float(dp[1].strip())
+            R = 6371000
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = (math.sin(dlat/2)**2 +
+                 math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                 math.sin(dlon/2)**2)
+            return max(0.0, R * 2 * math.asin(math.sqrt(a)) * 1.3)
+    except:
+        pass
+    return 100000.0
+
+def _estimate_distance_matrix(locations):
+    n = len(locations)
+    dm = [[0.0] * n for _ in range(n)]
+    coords = []
+    for loc in locations:
+        try:
+            p = str(loc).split(',')
+            coords.append((float(p[0].strip()), float(p[1].strip())) if len(p) >= 2 else None)
+        except:
+            coords.append(None)
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                if coords[i] and coords[j]:
+                    lat1, lon1 = coords[i]
+                    lat2, lon2 = coords[j]
+                    R = 6371000
+                    dlat = math.radians(lat2 - lat1)
+                    dlon = math.radians(lon2 - lon1)
+                    a = (math.sin(dlat/2)**2 +
+                         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                         math.sin(dlon/2)**2)
+                    dm[i][j] = max(0.0, R * 2 * math.asin(math.sqrt(a)) * 1.3)
+                else:
+                    dm[i][j] = 100000.0
+    return dm
+
+# ==================== DEMARRAGE ====================
 
 if __name__ == '__main__':
-    print("🚀 Démarrage de l'API sur http://localhost:5000")
-    print("📖 Testez avec: http://localhost:5000/health")
+    print("Demarrage API sur http://localhost:5000")
+    print("Test: http://localhost:5000/health")
     if gmaps is None:
-        print("⚠️  Google Maps non configuré - Distances estimées seront utilisées")
-        print("💡 Ajoutez votre clé API Google Maps pour vraies distances")
-
+        print("Google Maps non configure - distances estimees")
     app.run(host='0.0.0.0', port=5000, debug=True)
