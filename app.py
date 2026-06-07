@@ -19,7 +19,7 @@ app = Flask(__name__)
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', 'AIzaSyAI-VXfNrlF7RmK9ED7Eo6_FMfxYWyE-nU')
 gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY) if GOOGLE_MAPS_API_KEY != 'VOTRE_CLE_API_ICI' else None
 
-CHUNK_SIZE = 20
+CHUNK_SIZE = 10
 CACHE_FILE = 'distances_cache.json'
 
 # =============================================================================
@@ -108,10 +108,24 @@ def optimize_route():
 
 def optimize_with_transporteurs(collectes, livraisons, transits, transporteurs, site, contraintes):
     solutions = []
+    adresse_transporteur_precedent = None
 
     for transporteur in transporteurs:
         print(f"\n{'='*60}")
         print(f"Transporteur: {transporteur['client']} ({transporteur['ID_transporteur']})")
+
+        # Supprimer uniquement les entrees du cache impliquant l'adresse
+        # du transporteur precedent. Les distances entre lieux communs
+        # (site, livraisons, transits) sont conservees et reutilisees.
+        if adresse_transporteur_precedent:
+            adresse_norm = adresse_transporteur_precedent.strip().lower()
+            cles_a_supprimer = [
+                k for k in _cache_distances
+                if k.startswith(adresse_norm + '|') or k.endswith('|' + adresse_norm)
+            ]
+            for k in cles_a_supprimer:
+                del _cache_distances[k]
+        adresse_transporteur_precedent = transporteur['adresse']
 
         collectes_ok  = []
         collectes_nok = []
@@ -149,9 +163,13 @@ def optimize_with_transporteurs(collectes, livraisons, transits, transporteurs, 
 
     def score(s):
         st = s['solution']['statistiques']
-        return (st['nombre_collectes_incluses'] +
-                st['nombre_livraisons_incluses'] +
-                st['nombre_transits_inclus'],
+        nb_trajets = (st['nombre_collectes_incluses'] +
+                      st['nombre_livraisons_incluses'] +
+                      st['nombre_transits_inclus'])
+        # Critere principal : max trajets couverts
+        # Departage 1 : min distance totale (inclut l'aller-retour transporteur<->site)
+        # Departage 2 : min duree totale
+        return (nb_trajets,
                 -st['distance_totale_km'],
                 -st['duree_totale_heures'])
 
@@ -481,10 +499,10 @@ def _construire_un_atome(S, livraisons_restantes, collectes_restantes,
     Construit UN atome complet Site->...->Site de facon iterative.
 
     Regles metier respectees :
-      - Livraison  : site → livraison → (collecte | debut_transit | site)
-      - Collecte   : (site | fin_transit | livraison) → collecte → site
-      - Transit    : (site | livraison) → debut_transit → fin_transit
-                     → (site | collecte | debut_transit)
+      - Livraison  : site -> livraison -> (collecte | debut_transit | site)
+      - Collecte   : (site | fin_transit | livraison) -> collecte -> site
+      - Transit    : (site | livraison) -> debut_transit -> fin_transit
+                     -> (site | collecte | debut_transit)
 
     L'atome stocke toujours ses arrets avec S en tete et S en queue :
       arrets = [S, noeud1, noeud2, ..., S]
@@ -557,7 +575,7 @@ def _construire_un_atome(S, livraisons_restantes, collectes_restantes,
         extensions = []
 
         # -- Livraison : uniquement depuis site, en debut d'atome --
-        # site → livraison
+        # site -> livraison
         if type_pos == 'site' and len(arrets) == 1 and not a_livraison:
             for liv in livraisons_restantes:
                 if not date_compatible(location_info[liv], date_candidate):
@@ -573,8 +591,8 @@ def _construire_un_atome(S, livraisons_restantes, collectes_restantes,
                     })
 
         # -- Transit : depuis site ou livraison --
-        # site → debut_transit  OU  livraison → debut_transit
-        # OU  fin_transit → debut_transit  (enchaînement)
+        # site -> debut_transit  OU  livraison -> debut_transit
+        # OU  fin_transit -> debut_transit  (enchaînement)
         if type_pos in ('site', 'livraison', 'fin_transit'):
             for tid in transits_restants:
                 if tid in transits_dans_atome:
@@ -707,7 +725,7 @@ def formater_solution_finale(solution, location_info,
                 'date_prevue': date_str
             }); ordre += 1
 
-        # Arrêts internes (tout sauf S initial et S final)
+        # Arrets internes (tout sauf S initial et S final)
         for idx in atome['arrets'][1:-1]:
             info = location_info[idx]
             t    = info['type']
@@ -805,23 +823,15 @@ def formater_solution_finale(solution, location_info,
 
 # ==================== DISTANCES ====================
 
+# Cache des distances en RAM pour eviter les appels Google Maps redondants
+# au sein d'un meme transporteur. Vide entre chaque transporteur.
+_cache_distances = {}
+
 def load_distances_cache():
-    try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-                print(f"   Cache charge ({len(cache)} entrees)")
-                return cache
-    except Exception as e:
-        print(f"   Erreur cache: {e}")
-    return {}
+    return _cache_distances
 
 def save_distances_cache(cache):
-    try:
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache, f, indent=2)
-    except Exception as e:
-        print(f"   Erreur sauvegarde cache: {e}")
+    pass
 
 def get_cache_key(origin, destination):
     try:
@@ -837,6 +847,7 @@ def get_distance_matrix(locations):
         return distance_matrix
 
     if gmaps is None:
+        print("ATTENTION: Google Maps non configure - distances estimees (resultats peu fiables)")
         return _estimate_distance_matrix(locations)
 
     cache = load_distances_cache()
